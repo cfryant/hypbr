@@ -475,7 +475,7 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
     )
 
 
-def synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path:
+def synthesize_hardops_plate(out_dir: Path, size: int = 512, transparency: str = "auto") -> Path:
     """Synthesize a pure gunmetal machined HardOps panel using 8-Azimuth HBAO + Bent Normal."""
     H = W = size
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -541,9 +541,27 @@ def synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path:
         (out_dir / "anisotropy.png", aniso["anisotropy_u8"]),
         (out_dir / "specular.png", aniso["specular_u8"]),
         (out_dir / "thickness.png", thick["thickness_u8"]),
-        (out_dir / "opacity.png", np.full((H, W), 255, dtype=np.uint8)),
-    ])
+    ] + ([(out_dir / "opacity.png", np.full((H, W), 255, dtype=np.uint8))] if normalize_transparency_mode(transparency) == "on" else []))
+    if normalize_transparency_mode(transparency) != "on" and (out_dir / "opacity.png").exists():
+        (out_dir / "opacity.png").unlink()
     return out_dir
+
+
+
+TRANSPARENCY_MODES = ("auto", "on", "off")
+MEANINGFUL_HOLE_FRAC = 0.005
+
+
+def normalize_transparency_mode(mode: str | None) -> str:
+    m = (mode or "auto").strip().lower()
+    if m not in TRANSPARENCY_MODES:
+        raise ValueError(f"Unsupported transparency mode {mode!r}; expected one of {TRANSPARENCY_MODES}")
+    return m
+
+
+def has_meaningful_cutout(opacity_01: np.ndarray, min_hole_frac: float = MEANINGFUL_HOLE_FRAC) -> bool:
+    """Return True when >0.5% of pixels have alpha < 0.5."""
+    return float(np.mean(opacity_01 < 0.5)) > min_hole_frac
 
 
 def list_materials() -> list[dict[str, str]]:
@@ -634,7 +652,7 @@ def render_studio_preview(
         col = diffuse + spec_ibl + spec_direct
         # Smooth ACES-like highlight roll-off
         col = col / (1.0 + 0.26 * col)
-        if opacity is not None and float(opacity.min()) < 0.99:
+        if opacity is not None and has_meaningful_cutout(opacity):
             col_np = col.cpu().numpy()
             return _composite_cutout_preview(col_np, opacity)
         out_u8 = torch.clamp(torch.pow(torch.clamp(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
@@ -696,7 +714,7 @@ def render_studio_preview(
     diffuse = diff_col * (0.24 + 0.86 * ndotl1[..., None] + 0.26 * ndotl2[..., None]) * (0.28 + 0.72 * ao3)
     col = diffuse + spec_ibl + spec_direct
     col = col / (1.0 + 0.26 * col)
-    if opacity is not None and float(opacity.min()) < 0.99:
+    if opacity is not None and has_meaningful_cutout(opacity):
         return _composite_cutout_preview(col, opacity)
     return np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
@@ -723,6 +741,7 @@ def synthesize_material(
     size: int = 512,
     seed: int | None = None,
     wear: float = 0.0,
+    transparency: str = "auto",
 ) -> Path:
     """Synthesize a complete seamless 15-map PBR material set into `out_dir`.
 
@@ -847,12 +866,15 @@ def synthesize_material(
         met_u8 = np.clip(met_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": N}, strength=0.25, max_boost=0.08)["roughness"]
-    if material_id in getattr(gd, "TRANSPARENT_MATERIALS", ()):
+    t_mode = normalize_transparency_mode(transparency)
+    if t_mode != "off" and material_id in getattr(gd, "TRANSPARENT_MATERIALS", ()):
         op_f = np.clip(1.0 - gd._smoothstep(0.52, 0.82, cav0), 0.0, 1.0).astype(np.float32)
     else:
         op_f = np.ones((H, W), dtype=np.float32)
+    meaningful_op = has_meaningful_cutout(op_f)
+    write_opacity = (t_mode == "on") or (t_mode == "auto" and meaningful_op)
     op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao, opacity=op_f)
+    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao, opacity=(op_f if write_opacity and meaningful_op else None))
 
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface({"circular": True}, {"height": h_n})
@@ -876,8 +898,9 @@ def synthesize_material(
         (d / "anisotropy.png", aniso["anisotropy_u8"]),
         (d / "specular.png", aniso["specular_u8"]),
         (d / "thickness.png", thick["thickness_u8"]),
-        (d / "opacity.png", op_u8),
-    ])
+    ] + ([(d / "opacity.png", op_u8)] if write_opacity else []))
+    if not write_opacity and (d / "opacity.png").exists():
+        (d / "opacity.png").unlink()
     return d
 
 
@@ -886,11 +909,12 @@ def synthesize_all(
     size: int = 512,
     materials: list[str] | None = None,
     wear: float = 0.0,
+    transparency: str = "auto",
 ) -> list[Path]:
     """Synthesize all (or selected) seamless materials into `out_dir/<material_id>/`."""
     root = Path(out_dir)
     ids = materials if materials is not None else [did for did, *_ in gd.DAILY_CATALOG]
-    return [synthesize_material(mid, root / mid, size=size, wear=wear) for mid in ids]
+    return [synthesize_material(mid, root / mid, size=size, wear=wear, transparency=transparency) for mid in ids]
 
 
 def main():

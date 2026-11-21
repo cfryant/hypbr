@@ -21,7 +21,6 @@ EXPECTED_MAPS = {
     "preview.png",
     "roughness.png",
     "specular.png",
-    "opacity.png",
     "thickness.png",
 }
 
@@ -36,6 +35,7 @@ def test_synthesize_single_material_seamless(tmp_path: Path) -> None:
     out_dir = synthesize_material("damascus_folded_steel", tmp_path / "damascus", size=128)
     produced = {p.name for p in out_dir.glob("*.png")}
     assert EXPECTED_MAPS.issubset(produced)
+    assert "opacity.png" not in produced
 
     h16 = Image.open(out_dir / "height16.png")
     assert h16.size == (128, 128)
@@ -98,15 +98,50 @@ def test_gpu_cpu_parity_periodic_fbm_and_preview() -> None:
     assert int(np.max(np.abs(g_prev.astype(int) - c_prev.astype(int)))) <= 1
 
 
-def test_opacity_cutout_chainlink_and_export(tmp_path: Path) -> None:
+def test_transparency_modes_auto_on_off(tmp_path: Path) -> None:
     import json
-    from hypbr import export_material
-    mat = synthesize_material("chainlink_fence_galvanized", tmp_path / "fence", size=256)
-    op = Image.open(mat / "opacity.png")
+    from hypbr import blend_materials, export_material
+
+    # 1. auto on transparent material (chainlink) -> writes opacity.png + MASK glTF
+    fence_auto = synthesize_material("chainlink_fence_galvanized", tmp_path / "fence_auto", size=128, transparency="auto")
+    op = Image.open(fence_auto / "opacity.png")
     assert op.mode == "L"
     assert op.getextrema()[0] < 10 and op.getextrema()[1] > 245
-    exp = export_material(mat, tmp_path / "fence_gltf", target="gltf")
-    doc = json.loads((exp / "material.gltf").read_text())
-    assert doc["materials"][0]["alphaMode"] == "MASK"
-    assert doc["materials"][0]["doubleSided"] is True
-    assert Image.open(exp / "baseColor.png").mode == "RGBA"
+    g_auto = export_material(fence_auto, tmp_path / "gltf_fence_auto", target="gltf", transparency="auto")
+    doc_auto = json.loads((g_auto / "material.gltf").read_text())
+    assert doc_auto["materials"][0]["alphaMode"] == "MASK"
+    assert doc_auto["materials"][0]["doubleSided"] is True
+    assert Image.open(g_auto / "baseColor.png").mode == "RGBA"
+
+    # 2. off on transparent material (chainlink) -> no opacity.png + OPAQUE RGB glTF
+    fence_off = synthesize_material("chainlink_fence_galvanized", tmp_path / "fence_off", size=128, transparency="off")
+    assert not (fence_off / "opacity.png").exists()
+    g_off = export_material(fence_auto, tmp_path / "gltf_fence_off", target="gltf", transparency="off")
+    doc_off = json.loads((g_off / "material.gltf").read_text())
+    assert "alphaMode" not in doc_off["materials"][0]
+    assert "doubleSided" not in doc_off["materials"][0]
+    assert Image.open(g_off / "baseColor.png").mode == "RGB"
+    assert not (g_off / "opacity.png").exists()
+
+    # 3. auto vs on on opaque material (bronze)
+    br_auto = synthesize_material("patinated_verdigris_bronze", tmp_path / "br_auto", size=128, transparency="auto")
+    assert not (br_auto / "opacity.png").exists()
+    br_on = synthesize_material("patinated_verdigris_bronze", tmp_path / "br_on", size=128, transparency="on")
+    assert (br_on / "opacity.png").exists()
+    # Even if all-white opacity.png exists, auto export keeps glTF OPAQUE (no >0.5% holes)
+    g_br_auto = export_material(br_on, tmp_path / "gltf_br_auto", target="gltf", transparency="auto")
+    doc_br_auto = json.loads((g_br_auto / "material.gltf").read_text())
+    assert "alphaMode" not in doc_br_auto["materials"][0]
+    assert Image.open(g_br_auto / "baseColor.png").mode == "RGB"
+    # Forced transparency="on" export sets MASK
+    g_br_on = export_material(br_auto, tmp_path / "gltf_br_on", target="gltf", transparency="on")
+    doc_br_on = json.loads((g_br_on / "material.gltf").read_text())
+    assert doc_br_on["materials"][0]["alphaMode"] == "MASK"
+
+    # 4. blend in auto mode: opaque + opaque -> no opacity.png; fence + opaque -> opacity.png; off -> no opacity.png
+    bl_opaque = blend_materials(br_auto, br_on, tmp_path / "bl_opaque", transparency="auto")
+    assert not (bl_opaque / "opacity.png").exists()
+    bl_fence = blend_materials(fence_auto, br_auto, tmp_path / "bl_fence", factor=0.3, transparency="auto")
+    assert (bl_fence / "opacity.png").exists()
+    bl_fence_off = blend_materials(fence_auto, br_auto, tmp_path / "bl_fence_off", factor=0.3, transparency="off")
+    assert not (bl_fence_off / "opacity.png").exists()

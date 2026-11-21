@@ -34,13 +34,13 @@ def _resolve_targets(raw: str) -> list[str]:
 def cmd_synth(args: argparse.Namespace) -> int:
     t0 = time.time()
     if args.material == "all":
-        paths = synthesize_all(args.out, size=args.size, wear=args.wear)
+        paths = synthesize_all(args.out, size=args.size, wear=args.wear, transparency=args.transparency)
         print(f"Synthesized {len(paths)} seamless 15-map PBR sets in {time.time() - t0:.1f}s -> {args.out}")
     elif args.material == "hardops_plate":
-        paths = [synthesize_hardops_plate(args.out / "hardops_plate", size=args.size)]
+        paths = [synthesize_hardops_plate(args.out / "hardops_plate", size=args.size, transparency=args.transparency)]
         print(f"Synthesized hardops_plate in {time.time() - t0:.2f}s -> {paths[0]}")
     else:
-        paths = [synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed, wear=args.wear)]
+        paths = [synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed, wear=args.wear, transparency=args.transparency)]
         print(f"Synthesized {args.material} (15 maps, {args.size}x{args.size}, wear={args.wear:.2f}) in {time.time() - t0:.2f}s -> {paths[0]}")
 
     if args.export:
@@ -48,7 +48,7 @@ def cmd_synth(args: argparse.Namespace) -> int:
         for mat_dir in paths:
             for tgt in targets:
                 exp_dir = mat_dir / "exports" / tgt
-                export_material(mat_dir, exp_dir, target=tgt, name=mat_dir.name)
+                export_material(mat_dir, exp_dir, target=tgt, name=mat_dir.name, transparency=args.transparency)
             print(f"  Exported {mat_dir.name} -> {', '.join(targets)} ({mat_dir / 'exports'})")
     return 0
 
@@ -59,14 +59,14 @@ def cmd_export(args: argparse.Namespace) -> int:
     mat_name = args.name or src.name
     for tgt in targets:
         dst = args.out if (len(targets) == 1 and not args.subdir) else (args.out / tgt)
-        export_material(src, dst, target=tgt, name=mat_name)
+        export_material(src, dst, target=tgt, name=mat_name, transparency=args.transparency)
         print(f"Exported [{tgt:10s}] -> {dst}")
     return 0
 
 
 def cmd_blend(args: argparse.Namespace) -> int:
     t0 = time.time()
-    out = blend_materials(args.dir_a, args.dir_b, args.out, factor=args.factor, contrast=args.contrast, mode=args.mode)
+    out = blend_materials(args.dir_a, args.dir_b, args.out, factor=args.factor, contrast=args.contrast, mode=args.mode, transparency=args.transparency)
     print(f"Blended {args.dir_a.name} + {args.dir_b.name} (mode={args.mode}, factor={args.factor:.2f}) in {time.time() - t0:.2f}s -> {out}")
     return 0
 
@@ -113,6 +113,8 @@ def cmd_photo(args: argparse.Namespace) -> int:
         argv.append("--tileable")
     if args.dx:
         argv.append("--dx")
+    if getattr(args, "transparency", "auto"):
+        argv += ["--transparency", args.transparency]
     old_argv = sys.argv
     try:
         sys.argv = ["hypbr-photo", *argv]
@@ -144,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Comma-separated engine export targets ({', '.join(SUPPORTED_TARGETS)}, all)",
     )
+    p_synth.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Transparency/opacity mode (default: auto)")
     p_synth.set_defaults(func=cmd_synth)
 
     p_exp = sub.add_parser("export", help="Export an existing hypbr material directory to game engines & 3D standards")
@@ -156,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--out", type=Path, required=True, help="Destination output directory")
     p_exp.add_argument("--name", type=str, default=None, help="Optional material name override")
     p_exp.add_argument("--subdir", action="store_true", help="Always write into <out>/<target>/ even for a single target")
+    p_exp.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Transparency/opacity mode (default: auto)")
     p_exp.set_defaults(func=cmd_export)
 
     p_blend = sub.add_parser("blend", help="Physically blend two hypbr materials via height-lerp, cavity, or linear mode")
@@ -165,6 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_blend.add_argument("--factor", type=float, default=0.5, help="Blend amount of B over A in [0, 1] (default: 0.5)")
     p_blend.add_argument("--contrast", type=float, default=0.15, help="Height transition sharpness (default: 0.15)")
     p_blend.add_argument("--mode", choices=("height", "cavity", "linear"), default="height", help="Blend mode")
+    p_blend.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Transparency/opacity mode (default: auto)")
     p_blend.set_defaults(func=cmd_blend)
 
     p_prev = sub.add_parser("preview", help="Launch a local interactive Three.js PBR studio preview")
@@ -191,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_photo.add_argument("--graph", type=Path, default=None, help="Optional custom JSON graph file")
     p_photo.add_argument("--tileable", action="store_true", help="Enable circular-padded seamless evaluation")
     p_photo.add_argument("--dx", action="store_true", help="Output DirectX (-Y) normals instead of OpenGL (+Y)")
+    p_photo.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Transparency/opacity mode (default: auto)")
     p_photo.set_defaults(func=cmd_photo)
 
     return p

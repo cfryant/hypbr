@@ -158,7 +158,8 @@ def verify_material(mat_dir: Path | str, seam_ratio_limit: float = 2.2) -> dict[
         if seam_op["border_l1"] > 0.03 and seam_op["seam_ratio"] > seam_ratio_limit:
             errors.append(f"opacity wrap seam detected (ratio={seam_op['seam_ratio']}, border_l1={seam_op['border_l1']})")
         checks["opacity"] = {
-            "has_cutout": bool(int(op_arr.min()) < 250),
+            "has_cutout": bool(float((op_arr < 128).mean()) > 0.005),
+            "hole_fraction": round(float((op_arr < 128).mean()), 4),
             "opacity_min": round(float(op_arr.min() / 255.0), 3),
             "opacity_mean": round(float(op_arr.mean() / 255.0), 3),
         }

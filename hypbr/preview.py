@@ -138,9 +138,10 @@ fetch("./opacity.png").then(r => r.ok ? r.blob() : null).then(blob => {{
     const ctx = c.getContext("2d");
     ctx.drawImage(img, 0, 0, c.width, c.height);
     const d = ctx.getImageData(0, 0, c.width, c.height).data;
-    let hasHoles = false;
-    for (let i = 0; i < d.length; i += 4) {{ if (d[i] < 245) {{ hasHoles = true; break; }} }}
-    if (hasHoles) {{
+    let holeCount = 0;
+    const totalPx = d.length / 4;
+    for (let i = 0; i < d.length; i += 4) {{ if (d[i] < 128) holeCount++; }}
+    if (totalPx > 0 && (holeCount / totalPx) > 0.005) {{
       const opTex = loadTex("opacity.png", false);
       pbrMat.alphaMap = opTex;
       pbrMat.alphaTest = 0.5;

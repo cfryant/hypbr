@@ -17,7 +17,7 @@ from PIL import Image
 from . import depthpro_pbr as dp
 from . import normal_graph as ng
 from . import procedural as gd
-from .synthesize import render_studio_preview, save_maps_parallel
+from .synthesize import has_meaningful_cutout, normalize_transparency_mode, render_studio_preview, save_maps_parallel
 
 
 def _load_srgb_linear(path: Path, size: tuple[int, int]) -> np.ndarray:
@@ -120,6 +120,7 @@ def blend_materials(
     factor: float = 0.5,
     contrast: float = 0.06,
     mode: str = "height",
+    transparency: str = "auto",
 ) -> Path:
     """Physically blend two hypbr material directories into a new seamless 15-map directory."""
     pa, pb, out = Path(dir_a), Path(dir_b), Path(out_dir)
@@ -210,12 +211,17 @@ def blend_materials(
     rough_u8 = np.clip(rough * 255.0 + 0.5, 0, 255).astype(np.uint8)
     orm_u8 = np.stack([hbao["ao_u8"], rough_u8, met_u8], axis=-1)
 
-    # 5. Physically-based studio preview (with metallic Fresnel IBL)
+    # 5. Physically-based studio preview + transparency gating
+    t_mode = normalize_transparency_mode(transparency)
+    src_has_op = (pa / "opacity.png").exists() or (pb / "opacity.png").exists()
     op_a = _load_gray_f32(pa / "opacity.png", size, 1.0)
     op_b = _load_gray_f32(pb / "opacity.png", size, 1.0)
-    op_f = np.clip((1.0 - surf_mask) * op_a + surf_mask * op_b, 0.0, 1.0).astype(np.float32)
+    src_meaningful = ((pa / "opacity.png").exists() and has_meaningful_cutout(op_a)) or ((pb / "opacity.png").exists() and has_meaningful_cutout(op_b))
+    op_f = np.clip((1.0 - surf_mask) * op_a + surf_mask * op_b, 0.0, 1.0).astype(np.float32) if t_mode != "off" else np.ones((size[1], size[0]), dtype=np.float32)
+    meaningful_op = has_meaningful_cutout(op_f)
+    write_opacity = (t_mode == "on") or (t_mode == "auto" and src_has_op and src_meaningful and meaningful_op)
     op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao, opacity=op_f)
+    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao, opacity=(op_f if write_opacity and meaningful_op else None))
 
     save_maps_parallel([
         (out / "albedo_delit.png", alb_u8),
@@ -234,7 +240,8 @@ def blend_materials(
         (out / "anisotropy.png", aniso["anisotropy_u8"]),
         (out / "specular.png", aniso["specular_u8"]),
         (out / "thickness.png", thick["thickness_u8"]),
-        (out / "opacity.png", op_u8),
         (out / "blend_mask.png", np.clip(surf_mask * 255.0 + 0.5, 0, 255).astype(np.uint8)),
-    ])
+    ] + ([(out / "opacity.png", op_u8)] if write_opacity else []))
+    if not write_opacity and (out / "opacity.png").exists():
+        (out / "opacity.png").unlink()
     return out

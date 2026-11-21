@@ -2031,6 +2031,7 @@ def main():
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--tileable", action="store_true")
     ap.add_argument("--dx", action="store_true", help="DirectX -Y normal output (default OpenGL +Y)")
+    ap.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Opacity/cutout emission mode")
     ap.add_argument("--strength", type=float, default=1.0, help="Final normal strength multiplier")
     args = ap.parse_args()
 
@@ -2098,8 +2099,27 @@ def main():
         Image.fromarray(aniso_u8).save(sub / "anisotropy.png")
         Image.fromarray(spec_u8).save(sub / "specular.png")
         Image.fromarray(thick_u8).save(sub / "thickness.png")
-        op_u8 = get_out(state, outs["opacity"]) if "opacity" in outs else np.full((args.size, args.size), 255, np.uint8)
-        Image.fromarray(op_u8).save(sub / "opacity.png")
+        t_mode = getattr(args, "transparency", "auto")
+        if t_mode != "off" and "opacity" in outs:
+            op_u8 = get_out(state, outs["opacity"])
+        else:
+            op_u8 = np.full((args.size, args.size), 255, np.uint8)
+        meaningful_op = float((op_u8 < 128).mean()) > 0.005
+        if t_mode == "on" or (t_mode == "auto" and meaningful_op):
+            Image.fromarray(op_u8).save(sub / "opacity.png")
+        elif (sub / "opacity.png").exists():
+            (sub / "opacity.png").unlink()
+        try:
+            from .synthesize import render_studio_preview
+            alb_lin = np.power(np.clip(albedo_u8.astype(np.float32) / 255.0, 0.0, 1.0), 2.2)
+            n_f = (n_u8.astype(np.float32) / 255.0) * 2.0 - 1.0
+            r_f = rough_u8.astype(np.float32) / 255.0
+            m_f = metal_u8.astype(np.float32) / 255.0
+            ao_f = ao_u8.astype(np.float32) / 255.0
+            op_f = (op_u8.astype(np.float32) / 255.0) if (t_mode != "off" and meaningful_op) else None
+            Image.fromarray(render_studio_preview(alb_lin, n_f, r_f, m_f, ao_f, opacity=op_f)).save(sub / "preview.png")
+        except Exception:
+            pass
         (sub / "graph.json").write_text(json.dumps(graph, indent=2))
 
         dp.make_comparison_sheet([

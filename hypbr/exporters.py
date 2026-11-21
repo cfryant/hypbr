@@ -82,13 +82,27 @@ def _detect_size(src_dir: Path) -> tuple[int, int]:
     raise FileNotFoundError(f"No PBR maps found in {src_dir}")
 
 
-def _load_cutout_opacity(src_dir: Path, size: tuple[int, int] | None = None) -> tuple[bool, np.ndarray | None]:
-    """Return (has_cutout, uint8_array) when opacity.png exists and has transparent pixels (<250)."""
+def _load_cutout_opacity(
+    src_dir: Path,
+    size: tuple[int, int] | None = None,
+    transparency: str = "auto",
+) -> tuple[bool, np.ndarray | None]:
+    """Return (has_cutout, uint8_array) honoring transparency mode ('auto' | 'on' | 'off')."""
+    mode = (transparency or "auto").strip().lower()
+    if mode not in ("auto", "on", "off"):
+        raise ValueError(f"Unsupported transparency mode {transparency!r}")
+    if mode == "off":
+        return False, None
     op_path = src_dir / "opacity.png"
     if not op_path.exists():
+        if mode == "on":
+            w, h = size or _detect_size(src_dir)
+            return True, np.full((h, w), 255, dtype=np.uint8)
         return False, None
     op = _load_gray(op_path, default=255, size=size)
-    return bool(int(op.min()) < 250), op
+    if mode == "on":
+        return True, op
+    return bool(float((op < 128).mean()) > 0.005), op
 
 
 def _save_rgba_with_opacity(rgb_path: Path, op_arr: np.ndarray, out_path: Path) -> None:
@@ -97,16 +111,17 @@ def _save_rgba_with_opacity(rgb_path: Path, op_arr: np.ndarray, out_path: Path) 
     Image.fromarray(rgba, mode="RGBA").save(out_path)
 
 
-def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False) -> Path:
+def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False, transparency: str = "auto") -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
     if has_cutout and op_arr is not None:
         _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "BaseMap.png")
     else:
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "BaseMap.png")
-    _copy_if_exists(src_dir / "opacity.png", out_dir / "OpacityMask.png")
+    if has_cutout:
+        _copy_if_exists(src_dir / "opacity.png", out_dir / "OpacityMask.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "NormalMap.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "HeightMap.png")
     _copy_if_exists(src_dir / "height16.png", out_dir / "HeightMap16.png")
@@ -166,15 +181,16 @@ def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False) -
     return out_dir
 
 
-def _export_godot(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_godot(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
     if has_cutout and op_arr is not None:
         _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "albedo.png")
     else:
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "albedo.png")
-    _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
+    if has_cutout:
+        _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "height.png")
@@ -212,7 +228,7 @@ heightmap_texture = ExtResource("4_height")
     return out_dir
 
 
-def _export_unreal(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_unreal(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -220,8 +236,9 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str) -> Path:
     _copy_if_exists(src_dir / "orm.png", out_dir / "T_ORM.png")
     _copy_if_exists(src_dir / "height16.png", out_dir / "T_Height16.png")
     _copy_if_exists(src_dir / "specular.png", out_dir / "T_Specular.png")
-    has_cutout, _ = _load_cutout_opacity(src_dir, size=size)
-    _copy_if_exists(src_dir / "opacity.png", out_dir / "T_OpacityMask.png")
+    has_cutout, _ = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
+    if has_cutout:
+        _copy_if_exists(src_dir / "opacity.png", out_dir / "T_OpacityMask.png")
 
     normal_gl = _load_rgb(src_dir / "normal.png", default=(128, 128, 255), size=size)
     Image.fromarray(_flip_normal_green(normal_gl), mode="RGB").save(out_dir / "T_Normal_DX.png")
@@ -255,8 +272,9 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str) -> Path:
     return out_dir
 
 
-def _export_blender(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_blender(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
     for src_name, dst_name in (
         ("albedo_delit.png", "albedo.png"),
         ("normal.png", "normal.png"),
@@ -348,8 +366,9 @@ if __name__ == "__main__":
     return out_dir
 
 
-def _export_threejs(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_threejs(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
+    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
     for src_name, dst_name in (
         ("albedo_delit.png", "color.png"),
         ("normal.png", "normal.png"),
@@ -362,7 +381,7 @@ def _export_threejs(src_dir: Path, out_dir: Path, name: str) -> Path:
     ):
         _copy_if_exists(src_dir / src_name, out_dir / dst_name)
 
-    has_cutout, _ = _load_cutout_opacity(src_dir)
+    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
     alpha_block = "\n    alphaMap: load(\"opacity.png\", false),\n    alphaTest: 0.5,\n    side: THREE.DoubleSide," if has_cutout else ""
     js = f"""// Auto-generated Three.js MeshPhysicalMaterial factory for `{name}`
 import * as THREE from "three";
@@ -400,15 +419,16 @@ export function createMaterial(
     return out_dir
 
 
-def _export_gltf(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_gltf(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
     if has_cutout and op_arr is not None:
         _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "baseColor.png")
     else:
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "baseColor.png")
-    _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
+    if has_cutout:
+        _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
 
@@ -515,11 +535,11 @@ def _export_vulkan(src_dir: Path, out_dir: Path, name: str) -> Path:
     return out_dir
 
 
-def _export_materialx(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_materialx(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png", "opacity.png"):
+    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png") + (("opacity.png",) if has_cutout else ()):
         _copy_if_exists(src_dir / fname, out_dir / fname)
-    has_cutout, _ = _load_cutout_opacity(src_dir)
     op_ng = '\n    <image name="img_opacity" type="float"><input name="file" type="filename" value="opacity.png" colorspace="lin_rec709" /></image>\n    <output name="out_opacity" type="float" nodename="img_opacity" />' if has_cutout else ""
     op_sr = f'\n    <input name="opacity" type="float" nodegraph="NG_{name}" output="out_opacity" />' if has_cutout else ""
 
@@ -610,7 +630,7 @@ def _build_uv_sphere(rings: int = 32, sectors: int = 64) -> tuple[np.ndarray, np
     )
 
 
-def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     """Export a single self-contained binary glTF 2.0 (.glb) preview sphere with embedded PBR maps."""
     out_dir.mkdir(parents=True, exist_ok=True)
     pos, nrm, tan, uv, idx = _build_uv_sphere()
@@ -637,7 +657,7 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
     bv_idx = add_view(idx.tobytes(), target=34963)
 
     import io
-    has_cutout, op_arr = _load_cutout_opacity(src_dir)
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, transparency=transparency)
     img_views: list[int] = []
     for fname in ("albedo_delit.png", "orm.png", "normal.png"):
         p = src_dir / fname
@@ -730,12 +750,12 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
     return out_dir
 
 
-def _export_usd(src_dir: Path, out_dir: Path, name: str) -> Path:
+def _export_usd(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
     """Export an OpenUSD ASCII (.usda) UsdPreviewSurface material (RealityKit / Omniverse / Houdini)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png", "opacity.png"):
+    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png") + (("opacity.png",) if has_cutout else ()):
         _copy_if_exists(src_dir / fname, out_dir / fname)
-    has_cutout, _ = _load_cutout_opacity(src_dir)
 
     safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
     if not safe or safe[0].isdigit():
@@ -854,6 +874,7 @@ def export_material(
     out_dir: Path | str,
     target: str,
     name: str | None = None,
+    transparency: str = "auto",
 ) -> Path:
     """Export a synthesized hypbr material directory to a target engine/format.
 
@@ -873,26 +894,26 @@ def export_material(
     t = target.lower().strip()
 
     if t == "unity":
-        return _export_unity(src, dst, mat_name, hdrp=False)
+        return _export_unity(src, dst, mat_name, hdrp=False, transparency=transparency)
     if t == "unity-hdrp":
-        return _export_unity(src, dst, mat_name, hdrp=True)
+        return _export_unity(src, dst, mat_name, hdrp=True, transparency=transparency)
     if t == "godot":
-        return _export_godot(src, dst, mat_name)
+        return _export_godot(src, dst, mat_name, transparency=transparency)
     if t == "unreal":
-        return _export_unreal(src, dst, mat_name)
+        return _export_unreal(src, dst, mat_name, transparency=transparency)
     if t == "blender":
-        return _export_blender(src, dst, mat_name)
+        return _export_blender(src, dst, mat_name, transparency=transparency)
     if t == "threejs":
-        return _export_threejs(src, dst, mat_name)
+        return _export_threejs(src, dst, mat_name, transparency=transparency)
     if t == "gltf":
-        return _export_gltf(src, dst, mat_name)
+        return _export_gltf(src, dst, mat_name, transparency=transparency)
     if t == "glb":
-        return _export_glb(src, dst, mat_name)
+        return _export_glb(src, dst, mat_name, transparency=transparency)
     if t == "vulkan":
         return _export_vulkan(src, dst, mat_name)
     if t == "materialx":
-        return _export_materialx(src, dst, mat_name)
+        return _export_materialx(src, dst, mat_name, transparency=transparency)
     if t == "usd":
-        return _export_usd(src, dst, mat_name)
+        return _export_usd(src, dst, mat_name, transparency=transparency)
 
     raise ValueError(f"Unsupported export target {target!r}. Choose one of: {', '.join(SUPPORTED_TARGETS)}")
