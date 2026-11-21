@@ -1287,18 +1287,27 @@ def node_horizon_bent_normal_ao(
     strength: float = 1.45,
     height_scale: float = 18.0,
     radii: tuple[int, ...] = (1, 2, 4, 8, 16, 28, 44),
+    ao_floor: float = 0.16,
+    res_invariant: bool = True,
     **_,
 ):
     """V13 True 8-Azimuth Horizon-Based Ambient Occlusion (HBAO/GTAO) + Tangent-Space Bent Normal.
-    Marches 8 compass directions across multiple pixel radii over `height`, measuring the maximum
+    Marches 8 compass directions across multiple UV-calibrated radii over `height`, measuring the maximum
     elevation horizon angle in each azimuth to compute exact hemisphere visibility (AO) AND the
     average unoccluded sky direction (Bent Normal) to eliminate indirect IBL light-leaking."""
     circ = ctx.get("circular", False)
     h = dp.normalize_height(inputs["height"].astype(np.float32), clip_pct=0.5)
     N = inputs["normal"].astype(np.float32) if "normal" in inputs and inputs["normal"] is not None else None
     H, W = h.shape
-    hs = float(height_scale)
-    eff_radii = tuple(r for r in radii if r < max(2, min(H, W) // 2)) or (1,)
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
+    hs = float(height_scale) * res_scale
+    falloff_k = 0.028 / max(res_scale, 0.25)
+    if res_invariant:
+        scaled = [max(1, int(round(r * res_scale))) for r in radii]
+        eff_radii = tuple(sorted({r for r in scaled if r < max(2, min(H, W) // 2)})) or (1,)
+    else:
+        eff_radii = tuple(r for r in radii if r < max(2, min(H, W) // 2)) or (1,)
+    floor_v = float(np.clip(ao_floor, 0.05, 0.50))
 
     dirs = [
         (1, 0), (-1, 0), (0, 1), (0, -1),
@@ -1328,12 +1337,12 @@ def node_horizon_bent_normal_ao(
                 dh = (h_s - ht_b) * hs
                 dist = float(r) * step_lens
                 sin_h = dh * torch.rsqrt(dh * dh + (dist * dist + 1e-6))
-                falloff = 1.0 / (1.0 + 0.025 * dist)
+                falloff = 1.0 / (1.0 + falloff_k * dist)
                 max_sin_h = torch.maximum(max_sin_h, torch.clamp(sin_h, 0.0, 0.98) * falloff)
 
             vis = 1.0 - max_sin_h
             ao_raw = torch.clamp(vis.mean(dim=0), 0.0, 1.0)
-            ao_f = torch.clamp(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0)
+            ao_f = torch.clamp(1.0 - float(strength) * (1.0 - ao_raw), floor_v, 1.0)
             cos_h = torch.sqrt(torch.clamp(1.0 - max_sin_h * max_sin_h, min=0.0))
             vc = vis * cos_h
             bx_t = (ux * vc * 0.55).sum(dim=0)
@@ -1370,8 +1379,8 @@ def node_horizon_bent_normal_ao(
                 dh = (h_s - h) * hs
                 dist = float(r) * step_len
                 sin_h = dh / np.sqrt(dh * dh + dist * dist + 1e-6)
-                # Distance falloff so distant macro hills don't over-darken micro crevices
-                falloff = 1.0 / (1.0 + 0.025 * dist)
+                # Resolution-invariant distance falloff so distant macro hills don't over-darken micro crevices
+                falloff = 1.0 / (1.0 + falloff_k * dist)
                 max_sin_h = np.maximum(max_sin_h, np.clip(sin_h, 0.0, 0.98) * falloff)
 
             # Visibility along this azimuth = 1 - sin(horizon_angle)
@@ -1384,7 +1393,7 @@ def node_horizon_bent_normal_ao(
             bz += vis * (0.45 + 0.55 * cos_h)
 
         ao_raw = np.clip(ao_acc / float(len(dirs)), 0.0, 1.0)
-        ao = np.clip(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0).astype(np.float32)
+        ao = np.clip(1.0 - float(strength) * (1.0 - ao_raw), floor_v, 1.0).astype(np.float32)
 
         # Combine unoccluded sky cone with surface normal for clean tangent-space bent normal
         bent = normalize_n(np.stack([bx, by, np.maximum(bz, 0.15)], axis=-1))
