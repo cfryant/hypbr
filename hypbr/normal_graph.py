@@ -1301,47 +1301,92 @@ def node_horizon_bent_normal_ao(
         (1, 0), (-1, 0), (0, 1), (0, -1),
         (1, 1), (-1, 1), (1, -1), (-1, -1),
     ]
-    ao_acc = np.zeros((H, W), dtype=np.float32)
-    bx = np.zeros((H, W), dtype=np.float32)
-    by = np.zeros((H, W), dtype=np.float32)
-    bz = np.zeros((H, W), dtype=np.float32)
+    use_gpu = (dp.DEVICE.type != "cpu") and (H * W >= 262144)
+    if use_gpu:
+        with torch.no_grad():
+            dev = dp.DEVICE
+            ht = torch.from_numpy(np.ascontiguousarray(h, dtype=np.float32)).to(dev)
+            ao_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
+            bx_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
+            by_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
+            bz_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
+            max_r = max(radii)
+            pad_mode = "circular" if circ else "replicate"
+            ht_pad = F.pad(ht[None, None], (max_r, max_r, max_r, max_r), mode=pad_mode)[0, 0]
 
-    for dx, dy in dirs:
-        step_len = math.hypot(dx, dy)
-        ux, uy = dx / step_len, dy / step_len
-        max_sin_h = np.zeros((H, W), dtype=np.float32)
-        for r in radii:
-            sx, sy = int(round(dx * r)), int(round(dy * r))
-            if circ:
-                h_s = np.roll(np.roll(h, -sy, axis=0), -sx, axis=1)
-            else:
-                pad_y = abs(sy)
-                pad_x = abs(sx)
-                hp = np.pad(h, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
-                h_s = hp[pad_y + sy:pad_y + sy + H, pad_x + sx:pad_x + sx + W]
-            dh = (h_s - h) * hs
-            dist = float(r) * step_len
-            sin_h = dh / np.sqrt(dh * dh + dist * dist + 1e-6)
-            # Distance falloff so distant macro hills don't over-darken micro crevices
-            falloff = 1.0 / (1.0 + 0.045 * dist)
-            max_sin_h = np.maximum(max_sin_h, np.clip(sin_h, 0.0, 0.98) * falloff)
+            for dx, dy in dirs:
+                step_len = math.hypot(dx, dy)
+                ux, uy = dx / step_len, dy / step_len
+                max_sin_h = torch.zeros((H, W), dtype=torch.float32, device=dev)
+                for r in radii:
+                    sx, sy = int(round(dx * r)), int(round(dy * r))
+                    h_s = ht_pad[max_r + sy:max_r + sy + H, max_r + sx:max_r + sx + W]
+                    dh = (h_s - ht) * hs
+                    dist = float(r) * step_len
+                    sin_h = dh * torch.rsqrt(dh * dh + (dist * dist + 1e-6))
+                    falloff = 1.0 / (1.0 + 0.045 * dist)
+                    max_sin_h = torch.maximum(max_sin_h, torch.clamp(sin_h, 0.0, 0.98) * falloff)
 
-        # Visibility along this azimuth = 1 - sin(horizon_angle)
-        vis = 1.0 - max_sin_h
-        ao_acc += vis
-        # Unoccluded bent ray leans away from high horizons (+Y OpenGL convention: dy=-1 is +Y)
-        cos_h = np.sqrt(np.maximum(0.0, 1.0 - max_sin_h * max_sin_h))
-        bx += ux * vis * cos_h * 0.55
-        by += (-uy) * vis * cos_h * 0.55
-        bz += vis * (0.45 + 0.55 * cos_h)
+                vis = 1.0 - max_sin_h
+                ao_t += vis
+                cos_h = torch.sqrt(torch.clamp(1.0 - max_sin_h * max_sin_h, min=0.0))
+                bx_t += ux * vis * cos_h * 0.55
+                by_t += (-uy) * vis * cos_h * 0.55
+                bz_t += vis * (0.45 + 0.55 * cos_h)
 
-    ao_raw = np.clip(ao_acc / float(len(dirs)), 0.0, 1.0)
-    ao = np.clip(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0).astype(np.float32)
+            ao_raw = torch.clamp(ao_t / float(len(dirs)), 0.0, 1.0)
+            ao_f = torch.clamp(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0)
+            bent_t = torch.stack([bx_t, by_t, torch.clamp(bz_t, min=0.15)], dim=-1)
+            bent_t = bent_t / (torch.linalg.norm(bent_t, dim=-1, keepdim=True) + 1e-8)
+            if N is not None:
+                nt = torch.from_numpy(np.ascontiguousarray(N, dtype=np.float32)).to(dev)
+                bent_t = 0.58 * nt + 0.42 * bent_t
+                bent_t = bent_t / (torch.linalg.norm(bent_t, dim=-1, keepdim=True) + 1e-8)
 
-    # Combine unoccluded sky cone with surface normal for clean tangent-space bent normal
-    bent = normalize_n(np.stack([bx, by, np.maximum(bz, 0.15)], axis=-1))
-    if N is not None:
-        bent = normalize_n(0.58 * N + 0.42 * bent)
+            ao = ao_f.cpu().numpy().astype(np.float32)
+            bent = bent_t.cpu().numpy().astype(np.float32)
+    else:
+        ao_acc = np.zeros((H, W), dtype=np.float32)
+        bx = np.zeros((H, W), dtype=np.float32)
+        by = np.zeros((H, W), dtype=np.float32)
+        bz = np.zeros((H, W), dtype=np.float32)
+
+        for dx, dy in dirs:
+            step_len = math.hypot(dx, dy)
+            ux, uy = dx / step_len, dy / step_len
+            max_sin_h = np.zeros((H, W), dtype=np.float32)
+            for r in radii:
+                sx, sy = int(round(dx * r)), int(round(dy * r))
+                if circ:
+                    h_s = np.roll(np.roll(h, -sy, axis=0), -sx, axis=1)
+                else:
+                    pad_y = abs(sy)
+                    pad_x = abs(sx)
+                    hp = np.pad(h, ((pad_y, pad_y), (pad_x, pad_x)), mode="edge")
+                    h_s = hp[pad_y + sy:pad_y + sy + H, pad_x + sx:pad_x + sx + W]
+                dh = (h_s - h) * hs
+                dist = float(r) * step_len
+                sin_h = dh / np.sqrt(dh * dh + dist * dist + 1e-6)
+                # Distance falloff so distant macro hills don't over-darken micro crevices
+                falloff = 1.0 / (1.0 + 0.045 * dist)
+                max_sin_h = np.maximum(max_sin_h, np.clip(sin_h, 0.0, 0.98) * falloff)
+
+            # Visibility along this azimuth = 1 - sin(horizon_angle)
+            vis = 1.0 - max_sin_h
+            ao_acc += vis
+            # Unoccluded bent ray leans away from high horizons (+Y OpenGL convention: dy=-1 is +Y)
+            cos_h = np.sqrt(np.maximum(0.0, 1.0 - max_sin_h * max_sin_h))
+            bx += ux * vis * cos_h * 0.55
+            by += (-uy) * vis * cos_h * 0.55
+            bz += vis * (0.45 + 0.55 * cos_h)
+
+        ao_raw = np.clip(ao_acc / float(len(dirs)), 0.0, 1.0)
+        ao = np.clip(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0).astype(np.float32)
+
+        # Combine unoccluded sky cone with surface normal for clean tangent-space bent normal
+        bent = normalize_n(np.stack([bx, by, np.maximum(bz, 0.15)], axis=-1))
+        if N is not None:
+            bent = normalize_n(0.58 * N + 0.42 * bent)
 
     return {
         "ao": ao,

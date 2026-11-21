@@ -6,10 +6,10 @@ from hypbr import list_materials, synthesize_material
 def main() -> None:
     out_root = Path("./output/examples")
     samples = [
-        "verdigris_patina_bronze",
+        "patinated_verdigris_bronze",
         "damascus_folded_steel",
-        "moroccan_fishscale_tile",
-        "emerald_tufted_velvet",
+        "mermaid_fishscale_tile",
+        "tufted_emerald_velvet",
     ]
 
     print("Sample built-in materials:")

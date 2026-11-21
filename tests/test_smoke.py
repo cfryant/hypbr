@@ -43,3 +43,27 @@ def test_synthesize_single_material_seamless(tmp_path: Path) -> None:
     orm = Image.open(out_dir / "orm.png")
     assert orm.size == (128, 128)
     assert orm.mode == "RGB"
+
+
+def test_gpu_cpu_parity_hbao_and_blur() -> None:
+    import numpy as np
+    import torch
+    from hypbr import depthpro_pbr as dp
+    from hypbr import normal_graph as ng
+
+    h = np.linspace(0.0, 1.0, 512 * 512, dtype=np.float32).reshape(512, 512)
+    h = np.sin(h * 12.0).astype(np.float32)
+    g_blur = dp.gaussian_blur_np(h, sigma=3.0, circular=True)
+    g_hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h})
+
+    old_dev = dp.DEVICE
+    try:
+        dp.DEVICE = torch.device("cpu")
+        c_blur = dp.gaussian_blur_np(h, sigma=3.0, circular=True)
+        c_hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h})
+    finally:
+        dp.DEVICE = old_dev
+
+    assert np.allclose(g_blur, c_blur, atol=1e-4)
+    assert np.allclose(g_hbao["ao"], c_hbao["ao"], atol=1e-4)
+    assert np.allclose(g_hbao["bent_normal"], c_hbao["bent_normal"], atol=1e-4)

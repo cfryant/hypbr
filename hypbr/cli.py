@@ -10,6 +10,7 @@ from pathlib import Path
 from . import normal_graph as ng
 from .exporters import SUPPORTED_TARGETS, export_material
 from .synthesize import list_materials, synthesize_all, synthesize_hardops_plate, synthesize_material
+from .verify import verify_material
 
 
 def cmd_list(_args: argparse.Namespace) -> int:
@@ -59,6 +60,27 @@ def cmd_export(args: argparse.Namespace) -> int:
         export_material(src, dst, target=tgt, name=mat_name)
         print(f"Exported [{tgt:10s}] -> {dst}")
     return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    report = verify_material(args.dir, seam_ratio_limit=args.seam_limit)
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        status = "PASS" if report["passed"] else "FAIL"
+        print(f"[{status}] {report['material']} ({report['checks'].get('resolution', '?')})")
+        if "seamless" in report["checks"]:
+            sh = report["checks"]["seamless"]["height"]["seam_ratio"]
+            sn = report["checks"]["seamless"]["normal"]["seam_ratio"]
+            print(f"  Seam ratio (height / normal): {sh:.3f} / {sn:.3f}")
+        if "normal" in report["checks"]:
+            n = report["checks"]["normal"]
+            print(f"  Normal unit err: {n['unit_length_error']:.4f} | +Z: {n['positive_z_fraction']:.4f} | Curl: {n['curl_residual_ratio']:.3f}")
+        for w in report["warnings"]:
+            print(f"  WARN: {w}")
+        for e in report["errors"]:
+            print(f"  ERR:  {e}")
+    return 0 if report["passed"] else 1
 
 
 def cmd_dump_preset(args: argparse.Namespace) -> int:
@@ -120,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--name", type=str, default=None, help="Optional material name override")
     p_exp.add_argument("--subdir", action="store_true", help="Always write into <out>/<target>/ even for a single target")
     p_exp.set_defaults(func=cmd_export)
+
+    p_ver = sub.add_parser("verify", help="Verify seamlessness, normal validity, ORM packing, and PBR physical ranges")
+    p_ver.add_argument("dir", type=Path, help="Material directory to verify")
+    p_ver.add_argument("--json", action="store_true", help="Print full JSON report")
+    p_ver.add_argument("--seam-limit", type=float, default=2.2, help="Max allowed border-to-interior seam ratio")
+    p_ver.set_defaults(func=cmd_verify)
 
     p_dump = sub.add_parser("dump-preset", help="Dump a built-in 47-node PBR graph preset as JSON")
     p_dump.add_argument("preset", nargs="?", default="v13-default", help="Preset name (default: v13-default)")

@@ -39,7 +39,11 @@ NEON_PATCH = Path(os.environ.get("HYPBR_DEPTHPRO_PATCH", PKG_DIR / "weights" / "
 ONNX_WSP = Path(os.environ.get("HYPBR_DEEPBUMP_ONNX", PKG_DIR / "weights" / "wsp_deepbump_pbr.onnx"))
 ONNX_CACHE = CACHE_DIR / "deepbump_normal.onnx"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+_ENV_DEV = os.environ.get("HYPBR_DEVICE", "").strip().lower()
+if _ENV_DEV:
+    DEVICE = torch.device(_ENV_DEV)
+else:
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
 
 
 def load_depthpro2_no_fov(preset_name: str = "depthpro2-s", precision=torch.float32):
@@ -83,23 +87,17 @@ def apply_neon_wsp_patch(model, circular_pad: bool = False):
 @torch.no_grad()
 def apply_pbr_weight_tweak(model, scale_weights=(1.85, 1.35, 0.65, 0.20),
                            boost_fine_res=1.35, circular_pad: bool = False):
-    """Fallback v1 DPT pyramid weight rebalance."""
+    """Analytic spectral DPT pyramid WeightCode surgery (zero training)."""
+    from .weightcode import apply_depthpro_weightcode
+
+    report = apply_depthpro_weightcode(
+        model,
+        scale_weights=scale_weights,
+        boost_fine_res=boost_fine_res,
+        circular_pad=circular_pad,
+    )
     sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    changed = 0
-    for lvl, s in enumerate(scale_weights):
-        k = f"decoder.convs.{lvl}.weight"
-        sd[k] = sd[k] * float(s)
-        changed += sd[k].numel()
-    for lvl, s in [(0, boost_fine_res), (1, 1.0 + 0.5 * (boost_fine_res - 1.0))]:
-        for suf in ("weight", "bias"):
-            k = f"decoder.fusions.{lvl}.resnet1.residual.3.{suf}"
-            if k in sd:
-                sd[k] = sd[k] * float(s)
-                changed += sd[k].numel()
-    model.load_state_dict(sd)
-    if circular_pad:
-        set_circular_padding(model, True)
-    return sd, changed
+    return sd, report.params_edited
 
 
 def set_circular_padding(model, enabled: bool):
@@ -127,6 +125,7 @@ def detrend_surface(h: np.ndarray, degree: int = 2) -> np.ndarray:
     return (h - (A @ coef).reshape(H, W)).astype(np.float32)
 
 
+@torch.no_grad()
 def gaussian_blur_np(arr: np.ndarray, sigma: float, circular: bool = False) -> np.ndarray:
     if sigma <= 0.1:
         return arr.astype(np.float32)
@@ -134,15 +133,17 @@ def gaussian_blur_np(arr: np.ndarray, sigma: float, circular: bool = False) -> n
     xs = np.arange(-rad, rad + 1, dtype=np.float32)
     ker = np.exp(-0.5 * (xs / sigma) ** 2)
     ker /= ker.sum()
-    t = torch.from_numpy(arr.astype(np.float32))[None, None]
+    use_gpu = (DEVICE.type != "cpu") and (arr.size >= 262144) and (rad < min(arr.shape[0], arr.shape[1]))
+    dev = DEVICE if use_gpu else torch.device("cpu")
+    t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32)).to(dev)[None, None]
     mode = "circular" if circular else "reflect"
-    k_h = torch.from_numpy(ker)[None, None, None, :]
-    k_v = torch.from_numpy(ker)[None, None, :, None]
+    k_h = torch.from_numpy(ker).to(dev)[None, None, None, :]
+    k_v = torch.from_numpy(ker).to(dev)[None, None, :, None]
     t = F.pad(t, (rad, rad, 0, 0), mode=mode)
     t = F.conv2d(t, k_h)
     t = F.pad(t, (0, 0, rad, rad), mode=mode)
     t = F.conv2d(t, k_v)
-    return t[0, 0].numpy()
+    return t[0, 0].cpu().numpy()
 
 
 def _morph_close_2d(arr: np.ndarray, radius: int, circular: bool = False) -> np.ndarray:
@@ -419,38 +420,31 @@ def screened_poisson_fusion(h_anchor: np.ndarray, N_guide: np.ndarray, lam: floa
 @torch.no_grad()
 def infer_inv_depth(model, rgb_uint8: np.ndarray, tileable: bool = False, rot4: bool = False) -> np.ndarray:
     """Run DepthPro2 inverse depth.
-    rot4=True averages 0/90/180/270 deg rotations, mathematically cancelling DepthPro2's
-    floor-vs-sky gravity perspective bias.
+
+    - `rot4=True` averages 0/90/180/270 deg rotations, cancelling perspective gravity bias.
+    - `tileable=True` applies exact 4-quadrant separable raised-cosine cyclic-shift blending,
+      eliminating ViT patch border seams (and cleanly composes with `rot4=True`).
     """
     from depth_pro_2.model import to_normalized_tensor
-    if rot4 and not tileable:
-        hs = []
-        for k in range(4):
-            rr = np.ascontiguousarray(np.rot90(rgb_uint8, k))
-            t = to_normalized_tensor(rr, DEVICE).unsqueeze(0)
-            hk = np.rot90(model(t)[0, 0].float().cpu().numpy(), (4 - k) % 4)
-            hs.append(detrend_surface(hk, degree=2))
-        if DEVICE.type == "mps":
-            torch.mps.empty_cache()
-        return np.mean(hs, axis=0).astype(np.float32)
+    from .weightcode import tileable_4quad_blend
 
-    H, W = rgb_uint8.shape[:2]
-    t = to_normalized_tensor(rgb_uint8, DEVICE).unsqueeze(0)
-    pred = model(t)[0, 0].float().cpu().numpy()
-    if tileable:
-        pred = detrend_surface(pred, degree=2)
-        sh_y, sh_x = H // 2, W // 2
-        rolled = np.roll(np.roll(rgb_uint8, sh_y, axis=0), sh_x, axis=1)
-        tr = to_normalized_tensor(rolled, DEVICE).unsqueeze(0)
-        pred_r = detrend_surface(model(tr)[0, 0].float().cpu().numpy(), degree=2)
-        pred_r = np.roll(np.roll(pred_r, -sh_y, axis=0), -sh_x, axis=1)
-        wy = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.linspace(0, 1, H, endpoint=False))
-        wx = 0.5 - 0.5 * np.cos(2.0 * np.pi * np.linspace(0, 1, W, endpoint=False))
-        w = np.outer(wy, wx).astype(np.float32)
-        pred = w * pred + (1.0 - w) * pred_r
+    def _run_once(img: np.ndarray) -> np.ndarray:
+        if rot4:
+            hs = []
+            for k in range(4):
+                rr = np.ascontiguousarray(np.rot90(img, k))
+                t = to_normalized_tensor(rr, DEVICE).unsqueeze(0)
+                hk = np.rot90(model(t)[0, 0].float().cpu().numpy(), (4 - k) % 4)
+                hs.append(detrend_surface(hk, degree=2))
+            return np.mean(hs, axis=0).astype(np.float32)
+        t = to_normalized_tensor(img, DEVICE).unsqueeze(0)
+        pred = model(t)[0, 0].float().cpu().numpy()
+        return detrend_surface(pred, degree=2) if tileable else pred
+
+    out = tileable_4quad_blend(rgb_uint8, _run_once) if tileable else _run_once(rgb_uint8)
     if DEVICE.type == "mps":
         torch.mps.empty_cache()
-    return pred
+    return out.astype(np.float32)
 
 
 def load_square_rgb(path: Path, size: int = 512) -> np.ndarray:

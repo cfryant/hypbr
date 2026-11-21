@@ -74,3 +74,23 @@ def test_all_engine_exporters(tmp_path: Path) -> None:
     root = ET.fromstring((tmp_path / "out" / "materialx" / "material.mtlx").read_text())
     assert root.tag == "materialx"
     assert root.attrib["version"] == "1.38"
+
+    # Single-file binary GLB: valid glTF 2.0 header + JSON + BIN chunks
+    import struct
+
+    glb_bytes = (tmp_path / "out" / "glb" / "damascus.glb").read_bytes()
+    magic, version, total_len = struct.unpack_from("<III", glb_bytes, 0)
+    assert magic == 0x46546C67
+    assert version == 2
+    assert total_len == len(glb_bytes)
+    j_len, j_type = struct.unpack_from("<II", glb_bytes, 12)
+    assert j_type == 0x4E4F534A
+    glb_doc = json.loads(glb_bytes[20 : 20 + j_len].decode("utf-8"))
+    assert glb_doc["materials"][0]["name"] == "damascus"
+    assert len(glb_doc["images"]) == 3
+
+    # OpenUSD ASCII (.usda): UsdPreviewSurface with proper normal scale/bias
+    usda = (tmp_path / "out" / "usd" / "material.usda").read_text()
+    assert "#usda 1.0" in usda
+    assert "UsdPreviewSurface" in usda
+    assert "float4 inputs:scale = (2, 2, 2, 1)" in usda

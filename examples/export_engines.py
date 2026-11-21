@@ -5,7 +5,7 @@ from hypbr import SUPPORTED_TARGETS, export_material, synthesize_material
 
 
 def main() -> None:
-    mat_id = "verdigris_patina_bronze"
+    mat_id = "patinated_verdigris_bronze"
     raw_dir = synthesize_material(mat_id, Path("./output/raw") / mat_id, size=512)
 
     for target in SUPPORTED_TARGETS:

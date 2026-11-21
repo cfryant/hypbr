@@ -43,19 +43,25 @@ hypbr list
 Synthesize a single seamless 15-map PBR material at `1024x1024`:
 
 ```bash
-hypbr synth verdigris_patina_bronze --size 1024 --out ./output/pbr
+hypbr synth patinated_verdigris_bronze --size 1024 --out ./output/pbr
 ```
 
 Synthesize and export directly to game engines & 3D tools in one command:
 
 ```bash
-hypbr synth verdigris_patina_bronze --size 1024 --export unity,godot,unreal,blender,threejs,vulkan --out ./output/pbr
+hypbr synth patinated_verdigris_bronze --size 1024 --export unity,godot,unreal,blender,threejs,vulkan --out ./output/pbr
 ```
 
 Or export any existing `hypbr` material directory:
 
 ```bash
-hypbr export ./output/pbr/verdigris_patina_bronze --target all --out ./output/engines/bronze
+hypbr export ./output/pbr/patinated_verdigris_bronze --target all --out ./output/engines/bronze
+```
+
+Verify seamlessness, normal validity, ORM packing, and physical PBR bounds (CI-ready exit code):
+
+```bash
+hypbr verify ./output/pbr/patinated_verdigris_bronze --json
 ```
 
 Synthesize a machined hard-surface panel (`hardops_plate`):
@@ -106,7 +112,7 @@ print("Saved 15 PBR maps to:", out_dir)
 ```python
 from hypbr import export_material, synthesize_material
 
-raw = synthesize_material("verdigris_patina_bronze", "./output/bronze", size=1024)
+raw = synthesize_material("patinated_verdigris_bronze", "./output/bronze", size=1024)
 export_material(raw, "./output/unity/bronze", target="unity")
 export_material(raw, "./output/godot/bronze", target="godot")
 export_material(raw, "./output/unreal/bronze", target="unreal")
@@ -140,8 +146,10 @@ See runnable scripts in [`examples/synthesize_pbr.py`](examples/synthesize_pbr.p
 | `blender` | OpenGL `+Y` | `import_blender.py` (one-click Blender 4.x Principled BSDF node tree with `sRGB`/`Non-Color` setup) + textures |
 | `threejs` | OpenGL `+Y` | `material.js` ES module (`MeshPhysicalMaterial` factory with `SRGBColorSpace` / `NoColorSpace` & anisotropy) + textures |
 | `gltf` | OpenGL `+Y` | `material.gltf` (glTF 2.0 `pbrMetallicRoughness` + `occlusionTexture` + `normalTexture`), `baseColor.png`, `orm.png`, `normal.png` |
+| `glb` | OpenGL `+Y` | Single self-contained binary `<name>.glb` preview sphere with embedded albedo, ORM & normal maps (drag-and-drop in Blender, Three.js, Godot, Quick Look) |
 | `vulkan` | OpenGL `+Y` | `vulkan_manifest.json` (`VK_FORMAT_*` bindings & `ktx create` UASTC/BC5 commands), `orm_unorm.png`, `normal_rg_bc5_src.png`, `height_r16.png` |
 | `materialx` | OpenGL `+Y` | `material.mtlx` (MaterialX 1.38 `standard_surface` + `displacement` for OpenUSD, Houdini, Maya, RealityKit) + textures |
+| `usd` | OpenGL `+Y` | `material.usda` (OpenUSD ASCII `UsdPreviewSurface` with exact `scale=(2,2,2)` / `bias=(-1,-1,-1)` normal decoding for RealityKit, visionOS, Omniverse) + textures |
 
 ## Output Maps
 
@@ -169,10 +177,12 @@ Every material synthesis writes a clean, renderer-ready directory compatible wit
 ## Architecture
 
 - [`hypbr/procedural.py`](hypbr/procedural.py): Exact periodic FBM, Voronoi, weave, tile, and metal microstructure heightfield generators.
-- [`hypbr/normal_graph.py`](hypbr/normal_graph.py): Composable 47-node PBR graph engine (RNM blending, Weickert structure tensors, analytic SDF bevels, 8-azimuth HBAO + bent normals, Toksvig Specular AA, ORM packing).
+- [`hypbr/normal_graph.py`](hypbr/normal_graph.py): Composable 47-node PBR graph engine (RNM blending, Weickert structure tensors, analytic SDF bevels, GPU-accelerated 8-azimuth HBAO + bent normals, Toksvig Specular AA, ORM packing).
 - [`hypbr/synthesize.py`](hypbr/synthesize.py): High-level material synthesis API combining periodic heightfields, physically based multi-tone albedo/metallic rules, and the 15-map export pipeline.
-- [`hypbr/depthpro_pbr.py`](hypbr/depthpro_pbr.py): Optional Apple Depth Pro + DeepBump ONNX neural depth/normal extraction with 4-rotation perspective cancellation and circular padding.
-- [`hypbr/exporters.py`](hypbr/exporters.py): Zero-dependency engine & standard exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `vulkan`, `materialx`).
+- [`hypbr/weightcode.py`](hypbr/weightcode.py): Zero-training analytic weight surgery (exact 9-mode orthonormal 3×3 spatial kernel filtering, SVD energy shrinkage, circular Conv2d padding, and 4-quadrant partition-of-unity tileable blending).
+- [`hypbr/depthpro_pbr.py`](hypbr/depthpro_pbr.py): Optional Apple Depth Pro + DeepBump ONNX neural relief extractor with 4-rotation perspective cancellation and GPU-accelerated Gaussian/HBAO kernels (`HYPBR_DEVICE=cpu|mps|cuda`).
+- [`hypbr/exporters.py`](hypbr/exporters.py): Zero-dependency engine & standard exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `glb`, `vulkan`, `materialx`, `usd`).
+- [`hypbr/verify.py`](hypbr/verify.py): Automated seamlessness, tangent normal validity, Helmholtz curl, ORM consistency, and PBR calibration QA verifier (`hypbr verify`).
 - [`hypbr/cli.py`](hypbr/cli.py): `hypbr` command-line interface.
 
 ## License

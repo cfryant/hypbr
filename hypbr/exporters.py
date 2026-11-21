@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +30,10 @@ SUPPORTED_TARGETS: tuple[str, ...] = (
     "blender",
     "threejs",
     "gltf",
+    "glb",
     "vulkan",
     "materialx",
+    "usd",
 )
 
 
@@ -511,6 +514,256 @@ def _export_materialx(src_dir: Path, out_dir: Path, name: str) -> Path:
     return out_dir
 
 
+def _build_uv_sphere(rings: int = 32, sectors: int = 64) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generate unit UV sphere geometry (positions, normals, tangents, uvs, indices) for GLB preview."""
+    verts = []
+    norms = []
+    tangs = []
+    uvs = []
+    for r in range(rings + 1):
+        v = r / rings
+        phi = v * np.pi
+        sp, cp = np.sin(phi), np.cos(phi)
+        for s in range(sectors + 1):
+            u = s / sectors
+            theta = u * 2.0 * np.pi
+            st, ct = np.sin(theta), np.cos(theta)
+            nx, ny, nz = sp * ct, cp, sp * st
+            verts.append((nx, ny, nz))
+            norms.append((nx, ny, nz))
+            tangs.append((-st, 0.0, ct, 1.0))
+            uvs.append((u * 2.0, v * 2.0))
+
+    indices = []
+    stride = sectors + 1
+    for r in range(rings):
+        for s in range(sectors):
+            a = r * stride + s
+            b = a + stride
+            indices.extend((a, b, a + 1, a + 1, b, b + 1))
+
+    return (
+        np.asarray(verts, dtype=np.float32),
+        np.asarray(norms, dtype=np.float32),
+        np.asarray(tangs, dtype=np.float32),
+        np.asarray(uvs, dtype=np.float32),
+        np.asarray(indices, dtype=np.uint16),
+    )
+
+
+def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
+    """Export a single self-contained binary glTF 2.0 (.glb) preview sphere with embedded PBR maps."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pos, nrm, tan, uv, idx = _build_uv_sphere()
+
+    bin_chunks: list[bytes] = []
+    buffer_views: list[dict[str, Any]] = []
+    offset = 0
+
+    def add_view(raw: bytes, target: int | None = None) -> int:
+        nonlocal offset
+        pad = (-len(raw)) % 4
+        view: dict[str, Any] = {"buffer": 0, "byteOffset": offset, "byteLength": len(raw)}
+        if target is not None:
+            view["target"] = target
+        bin_chunks.append(raw + (b"\x00" * pad))
+        offset += len(raw) + pad
+        buffer_views.append(view)
+        return len(buffer_views) - 1
+
+    bv_pos = add_view(pos.tobytes(), target=34962)
+    bv_nrm = add_view(nrm.tobytes(), target=34962)
+    bv_tan = add_view(tan.tobytes(), target=34962)
+    bv_uv = add_view(uv.tobytes(), target=34962)
+    bv_idx = add_view(idx.tobytes(), target=34963)
+
+    img_views: list[int] = []
+    for fname in ("albedo_delit.png", "orm.png", "normal.png"):
+        p = src_dir / fname
+        if not p.exists():
+            raise FileNotFoundError(f"Required map missing for GLB export: {p}")
+        img_views.append(add_view(p.read_bytes()))
+
+    bin_data = b"".join(bin_chunks)
+    gltf_doc: dict[str, Any] = {
+        "asset": {"version": "2.0", "generator": "hypbr"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "name": name}],
+        "meshes": [
+            {
+                "name": f"{name}_sphere",
+                "primitives": [
+                    {
+                        "attributes": {"POSITION": 0, "NORMAL": 1, "TANGENT": 2, "TEXCOORD_0": 3},
+                        "indices": 4,
+                        "material": 0,
+                    }
+                ],
+            }
+        ],
+        "buffers": [{"byteLength": len(bin_data)}],
+        "bufferViews": buffer_views,
+        "accessors": [
+            {
+                "bufferView": bv_pos,
+                "componentType": 5126,
+                "count": len(pos),
+                "type": "VEC3",
+                "min": pos.min(axis=0).tolist(),
+                "max": pos.max(axis=0).tolist(),
+            },
+            {"bufferView": bv_nrm, "componentType": 5126, "count": len(nrm), "type": "VEC3"},
+            {"bufferView": bv_tan, "componentType": 5126, "count": len(tan), "type": "VEC4"},
+            {"bufferView": bv_uv, "componentType": 5126, "count": len(uv), "type": "VEC2"},
+            {"bufferView": bv_idx, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
+        ],
+        "samplers": [{"magFilter": 9729, "minFilter": 9987, "wrapS": 10497, "wrapT": 10497}],
+        "images": [
+            {"bufferView": img_views[0], "mimeType": "image/png", "name": "baseColor"},
+            {"bufferView": img_views[1], "mimeType": "image/png", "name": "orm"},
+            {"bufferView": img_views[2], "mimeType": "image/png", "name": "normal"},
+        ],
+        "textures": [
+            {"sampler": 0, "source": 0},
+            {"sampler": 0, "source": 1},
+            {"sampler": 0, "source": 2},
+        ],
+        "materials": [
+            {
+                "name": name,
+                "pbrMetallicRoughness": {
+                    "baseColorTexture": {"index": 0},
+                    "metallicRoughnessTexture": {"index": 1},
+                    "metallicFactor": 1.0,
+                    "roughnessFactor": 1.0,
+                },
+                "occlusionTexture": {"index": 1, "strength": 1.0},
+                "normalTexture": {"index": 2, "scale": 1.0},
+            }
+        ],
+    }
+
+    json_bytes = json.dumps(gltf_doc, separators=(",", ":")).encode("utf-8")
+    json_pad = (-len(json_bytes)) % 4
+    json_bytes += b" " * json_pad
+
+    total_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+    glb_path = out_dir / f"{name}.glb"
+    with glb_path.open("wb") as f:
+        f.write(struct.pack("<III", 0x46546C67, 2, total_len))
+        f.write(struct.pack("<II", len(json_bytes), 0x4E4F534A))
+        f.write(json_bytes)
+        f.write(struct.pack("<II", len(bin_data), 0x004E4942))
+        f.write(bin_data)
+    return out_dir
+
+
+def _export_usd(src_dir: Path, out_dir: Path, name: str) -> Path:
+    """Export an OpenUSD ASCII (.usda) UsdPreviewSurface material (RealityKit / Omniverse / Houdini)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png"):
+        _copy_if_exists(src_dir / fname, out_dir / fname)
+
+    safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
+    if not safe or safe[0].isdigit():
+        safe = f"M_{safe}"
+
+    usda = f"""#usda 1.0
+(
+    defaultPrim = "{safe}_Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "{safe}_Root"
+{{
+    def Material "{safe}"
+    {{
+        token outputs:surface.connect = </{safe}_Root/{safe}/PreviewSurface.outputs:surface>
+
+        def Shader "PreviewSurface"
+        {{
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor.connect = </{safe}_Root/{safe}/TexAlbedo.outputs:rgb>
+            float inputs:metallic.connect = </{safe}_Root/{safe}/TexMetallic.outputs:r>
+            float inputs:roughness.connect = </{safe}_Root/{safe}/TexRoughness.outputs:r>
+            float inputs:occlusion.connect = </{safe}_Root/{safe}/TexAO.outputs:r>
+            normal3f inputs:normal.connect = </{safe}_Root/{safe}/TexNormal.outputs:rgb>
+            float inputs:ior = 1.5
+            token outputs:surface
+        }}
+
+        def Shader "PrimvarReader"
+        {{
+            uniform token info:id = "UsdPrimvarReader_float2"
+            token inputs:varname = "st"
+            float2 outputs:result
+        }}
+
+        def Shader "TexAlbedo"
+        {{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./albedo_delit.png@
+            token inputs:sourceColorSpace = "sRGB"
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            color3f outputs:rgb
+        }}
+
+        def Shader "TexRoughness"
+        {{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./roughness.png@
+            token inputs:sourceColorSpace = "raw"
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            float outputs:r
+        }}
+
+        def Shader "TexMetallic"
+        {{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./metallic.png@
+            token inputs:sourceColorSpace = "raw"
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            float outputs:r
+        }}
+
+        def Shader "TexAO"
+        {{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./ao.png@
+            token inputs:sourceColorSpace = "raw"
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            float outputs:r
+        }}
+
+        def Shader "TexNormal"
+        {{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./normal.png@
+            token inputs:sourceColorSpace = "raw"
+            float4 inputs:scale = (2, 2, 2, 1)
+            float4 inputs:bias = (-1, -1, -1, 0)
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            normal3f outputs:rgb
+        }}
+    }}
+}}
+"""
+    (out_dir / "material.usda").write_text(usda)
+    return out_dir
+
+
 def export_material(
     src_dir: Path | str,
     out_dir: Path | str,
@@ -523,7 +776,7 @@ def export_material(
         src_dir: Directory containing hypbr PBR maps (`albedo_delit.png`, `normal.png`, etc.).
         out_dir: Destination directory for the engine-formatted output.
         target: One of `SUPPORTED_TARGETS` (e.g. "unity", "unity-hdrp", "godot",
-            "unreal", "blender", "threejs", "gltf", "vulkan", "materialx").
+            "unreal", "blender", "threejs", "gltf", "glb", "vulkan", "materialx", "usd").
         name: Optional material name (defaults to `src_dir.name`).
 
     Returns:
@@ -548,9 +801,13 @@ def export_material(
         return _export_threejs(src, dst, mat_name)
     if t == "gltf":
         return _export_gltf(src, dst, mat_name)
+    if t == "glb":
+        return _export_glb(src, dst, mat_name)
     if t == "vulkan":
         return _export_vulkan(src, dst, mat_name)
     if t == "materialx":
         return _export_materialx(src, dst, mat_name)
+    if t == "usd":
+        return _export_usd(src, dst, mat_name)
 
     raise ValueError(f"Unsupported export target {target!r}. Choose one of: {', '.join(SUPPORTED_TARGETS)}")
