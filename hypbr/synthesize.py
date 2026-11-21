@@ -21,9 +21,11 @@ Upgrades every material from flat single-tint albedo & basic AO to AAA studio qu
 import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
 from . import depthpro_pbr as dp          # noqa: E402
@@ -421,6 +423,126 @@ def list_materials() -> list[dict[str, str]]:
     ]
 
 
+def save_maps_parallel(items: list[tuple[Path, np.ndarray]], compress_level: int = 4) -> None:
+    """Save multiple lossless PNG maps concurrently (Pillow releases the GIL during zlib)."""
+    def _write(pair: tuple[Path, np.ndarray]) -> None:
+        p, arr = pair
+        Image.fromarray(arr).save(p, compress_level=compress_level)
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(items)))) as pool:
+        list(pool.map(_write, items))
+
+
+@torch.no_grad()
+def render_studio_preview(
+    alb_lin: np.ndarray,
+    N: np.ndarray,
+    rough: np.ndarray,
+    met: np.ndarray,
+    ao: np.ndarray,
+) -> np.ndarray:
+    """Physically-based metallic/dielectric studio preview with Fresnel IBL & key/rim softboxes."""
+    if dp.DEVICE.type != "cpu" and rough.size >= 262144:
+        dev = dp.DEVICE
+        alb_t = torch.from_numpy(np.ascontiguousarray(alb_lin, dtype=np.float32)).to(dev)
+        n_t = torch.from_numpy(np.ascontiguousarray(N, dtype=np.float32)).to(dev)
+        r_t = torch.clamp(torch.from_numpy(np.ascontiguousarray(rough, dtype=np.float32)).to(dev), 0.06, 0.98)
+        m3 = torch.from_numpy(np.ascontiguousarray(met, dtype=np.float32)).to(dev).unsqueeze(-1)
+        ao3 = torch.from_numpy(np.ascontiguousarray(ao, dtype=np.float32)).to(dev).unsqueeze(-1)
+
+        l1 = torch.tensor([0.48, 0.55, 0.68], dtype=torch.float32, device=dev); l1 = l1 / torch.linalg.norm(l1)
+        l2 = torch.tensor([-0.62, -0.25, 0.74], dtype=torch.float32, device=dev); l2 = l2 / torch.linalg.norm(l2)
+        v_vec = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=dev)
+        h1 = l1 + v_vec; h1 = h1 / torch.linalg.norm(h1)
+        h2 = l2 + v_vec; h2 = h2 / torch.linalg.norm(h2)
+
+        ndotl1 = torch.clamp((n_t * l1).sum(dim=-1), 0.0, 1.0)
+        ndotl2 = torch.clamp((n_t * l2).sum(dim=-1), 0.0, 1.0)
+        ndoth1 = torch.clamp((n_t * h1).sum(dim=-1), 0.0, 1.0)
+        ndoth2 = torch.clamp((n_t * h2).sum(dim=-1), 0.0, 1.0)
+        ndotv = torch.clamp(n_t[..., 2], 0.02, 1.0)
+
+        diff_col = alb_t * (1.0 - m3)
+        f0 = 0.04 * (1.0 - m3) + alb_t * m3
+        fresnel = f0 + (1.0 - f0) * torch.pow(1.0 - ndotv, 5.0).unsqueeze(-1)
+
+        rx = 2.0 * ndotv * n_t[..., 0]
+        ry = 2.0 * ndotv * n_t[..., 1]
+        sky_grad = torch.clamp(0.5 + 0.5 * ry, 0.0, 1.0).unsqueeze(-1)
+        softbox = torch.clamp(1.0 - torch.hypot(rx - 0.35, ry - 0.45) * 1.15, 0.0, 1.0).unsqueeze(-1).square()
+        c_gnd = torch.tensor([0.16, 0.17, 0.20], dtype=torch.float32, device=dev)
+        c_sky = torch.tensor([0.62, 0.67, 0.76], dtype=torch.float32, device=dev)
+        c_box = torch.tensor([1.25, 1.18, 1.08], dtype=torch.float32, device=dev)
+        c_blr = torch.tensor([0.38, 0.39, 0.42], dtype=torch.float32, device=dev)
+        env_sharp = (1.0 - sky_grad) * c_gnd + sky_grad * c_sky + softbox * c_box
+        r3 = r_t.unsqueeze(-1)
+        ibl_rad = env_sharp * torch.pow(1.0 - r3, 1.4) + c_blr * torch.pow(r3, 1.2)
+        spec_ibl = fresnel * ibl_rad * (0.28 + 0.72 * ao3) * (0.55 + 0.95 * (1.0 - r3))
+
+        shin = torch.clamp(2.0 / torch.pow(r_t, 2.6) - 2.0, 3.0, 260.0)
+        norm_fac = (shin + 2.0) / 14.0
+        spec_direct = (
+            fresnel
+            * (torch.pow(ndoth1, shin) * norm_fac * 0.42 + torch.pow(ndoth2, shin) * norm_fac * 0.16).unsqueeze(-1)
+            * (0.35 + 0.65 * ao3)
+        )
+        diffuse = diff_col * (0.22 + 0.85 * ndotl1.unsqueeze(-1) + 0.24 * ndotl2.unsqueeze(-1)) * (0.25 + 0.75 * ao3)
+        col = diffuse + spec_ibl + spec_direct
+        col = col / (1.0 + 0.25 * col)
+        out_u8 = torch.clamp(torch.pow(torch.clamp(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
+        return out_u8.cpu().numpy()
+
+    L1 = np.array([0.48, 0.55, 0.68], np.float32); L1 /= np.linalg.norm(L1)
+    L2 = np.array([-0.62, -0.25, 0.74], np.float32); L2 /= np.linalg.norm(L2)
+    V = np.array([0.0, 0.0, 1.0], np.float32)
+    H1 = L1 + V; H1 /= np.linalg.norm(H1)
+    H2 = L2 + V; H2 /= np.linalg.norm(H2)
+
+    ndotl1 = np.clip((N * L1[None, None, :]).sum(-1), 0.0, 1.0)
+    ndotl2 = np.clip((N * L2[None, None, :]).sum(-1), 0.0, 1.0)
+    ndoth1 = np.clip((N * H1[None, None, :]).sum(-1), 0.0, 1.0)
+    ndoth2 = np.clip((N * H2[None, None, :]).sum(-1), 0.0, 1.0)
+    ndotv = np.clip(N[..., 2], 0.02, 1.0)
+
+    m3 = met[..., None]
+    r = np.clip(rough, 0.06, 0.98)
+    ao3 = ao[..., None]
+
+    # Metal/dielectric energy split & Schlick Fresnel
+    diff_col = alb_lin * (1.0 - m3)
+    f0 = 0.04 * (1.0 - m3) + alb_lin * m3
+    fresnel = f0 + (1.0 - f0) * ((1.0 - ndotv) ** 5)[..., None]
+
+    # Analytic studio IBL reflection along reflected view vector R = 2*(N.V)*N - V
+    rx = 2.0 * ndotv * N[..., 0]
+    ry = 2.0 * ndotv * N[..., 1]
+    sky_grad = np.clip(0.5 + 0.5 * ry, 0.0, 1.0)[..., None]
+    softbox = np.clip(1.0 - np.hypot(rx - 0.35, ry - 0.45) * 1.15, 0.0, 1.0)[..., None] ** 2
+    env_sharp = (
+        (1.0 - sky_grad) * np.array([0.16, 0.17, 0.20], np.float32)
+        + sky_grad * np.array([0.62, 0.67, 0.76], np.float32)
+        + softbox * np.array([1.25, 1.18, 1.08], np.float32)
+    )
+    env_blur = np.array([0.38, 0.39, 0.42], np.float32)[None, None, :]
+    ibl_rad = env_sharp * ((1.0 - r[..., None]) ** 1.4) + env_blur * (r[..., None] ** 1.2)
+    spec_ibl = fresnel * ibl_rad * (0.28 + 0.72 * ao3) * (0.55 + 0.95 * (1.0 - r[..., None]))
+
+    # Direct GGX-like specular lobes
+    shin = np.clip(2.0 / (r ** 2.6) - 2.0, 3.0, 260.0)
+    norm_fac = (shin + 2.0) / 14.0
+    spec_direct = (
+        fresnel
+        * ((ndoth1 ** shin) * norm_fac * 0.42 + (ndoth2 ** shin) * norm_fac * 0.16)[..., None]
+        * (0.35 + 0.65 * ao3)
+    )
+
+    diffuse = diff_col * (0.22 + 0.85 * ndotl1[..., None] + 0.24 * ndotl2[..., None]) * (0.25 + 0.75 * ao3)
+    col = diffuse + spec_ibl + spec_direct
+    # Soft ACES-like highlight roll-off to prevent clipping shiny metals
+    col = col / (1.0 + 0.25 * col)
+    return np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 def synthesize_material(
     material_id: str,
     out_dir: Path | str,
@@ -452,7 +574,7 @@ def synthesize_material(
     N = gd._height_to_normal_periodic(h0, slope=slope_scale)
     g_kind = "mineral" if mat_kind in ("concrete", "ceramic") else ("brushed" if mat_kind in ("metal", "carbon") else "cast")
     g_str = 0.04 if mat_kind in ("ceramic", "carbon") else 0.065
-    N = ng.node_micro_grain({"circular": True}, {"normal": N}, kind=g_kind, scale=36.0, strength=g_str + 0.03 * w_amt, seed=s_base + 1000)["normal"]
+    N = ng.node_micro_grain({"circular": True}, {"normal": N}, kind=g_kind, scale=36.0, strength=g_str + 0.045 * w_amt, seed=s_base + 1000)["normal"]
     N = ng.node_normal_clamp_slope({"circular": True}, {"normal": N}, max_angle_deg=58.0)["normal"]
 
     hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h_n, "normal": N}, strength=1.50, height_scale=18.0)
@@ -464,54 +586,71 @@ def synthesize_material(
     met_f = met_u8.astype(np.float32) / 255.0
 
     if w_amt > 1e-4:
-        w_noise = np.clip(0.5 + 0.35 * gd._periodic_fbm(H, W, s_base + 7777, (4, 8, 16, 32)), 0.0, 1.0)
-        grime = np.clip((1.0 - ao) * (0.55 + 0.9 * w_noise) * w_amt, 0.0, 0.85)
-        edge_scuff = np.clip(curv["convex"] * (0.45 + 0.85 * w_noise) * w_amt, 0.0, 0.85)
-        grime_col = np.array([0.075, 0.068, 0.058], dtype=np.float32)[None, None, :]
-        scuff_col = np.clip(alb_lin * 1.25 + 0.06, 0.0, 0.92)
-        alb_lin = alb_lin * (1.0 - grime[..., None] * 0.65) + grime_col * (grime[..., None] * 0.65)
-        alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.35) + scuff_col * (edge_scuff[..., None] * 0.35)
+        w_macro = np.clip(0.5 + 0.42 * gd._periodic_fbm(H, W, s_base + 7777, (4, 8, 16)), 0.0, 1.0)
+        w_fine = np.clip(0.5 + 0.45 * gd._periodic_fbm(H, W, s_base + 8888, (16, 32, 64)), 0.0, 1.0)
+        valley = np.clip(0.55 * (1.0 - ao) + 0.45 * np.clip(1.0 - h_n, 0.0, 1.0), 0.0, 1.0)
+        # Thresholded organic tarnish/patina mask with fine-grain edge breakup (no airbrushed halos)
+        raw_patina = valley * 0.80 + w_macro * 0.48 + w_fine * 0.42 - (1.02 - 0.74 * w_amt)
+        patina = np.clip(raw_patina * (2.2 + 1.5 * w_amt), 0.0, 0.94)
+        patina = (patina * patina * (3.0 - 2.0 * patina)).astype(np.float32)
+
+        edge_scuff = np.clip(curv["convex"] * (0.5 + 0.9 * w_fine) * w_amt * 1.4, 0.0, 0.90)
+
+        is_cu = any(k in material_id for k in ("copper", "bronze", "brass")) or mat_kind in ("copper", "bronze", "brass")
+        is_metal = (mat_kind in ("metal", "copper", "bronze", "brass", "gold", "steel", "iron")) or (float(met_f.mean()) > 0.35)
+        if is_metal:
+            # Deep oxide tarnish + authentic muted verdigris patina (Cu/Br) or dark rust-umber (Fe/steel)
+            oxide_dark = np.array([0.072, 0.052, 0.040], dtype=np.float32)[None, None, :]
+            patina_accent = np.array([0.095, 0.285, 0.235] if is_cu else [0.21, 0.082, 0.036], dtype=np.float32)[None, None, :]
+            # At medium wear (0.45): mostly dark oxide tarnish with subtle verdigris pockets;
+            # at heavy wear (0.90): rich blue-green verdigris crust settling across valleys
+            accent_w = np.clip((w_macro * 0.55 + valley * 0.45 - (0.58 - 0.36 * w_amt)) * 2.6, 0.0, 1.0)[..., None] * (w_amt ** 0.75)
+            tarnish_col = oxide_dark * (1.0 - accent_w) + patina_accent * accent_w
+            alb_lin = alb_lin * (1.0 - patina[..., None] * 0.90) + tarnish_col * (patina[..., None] * 0.90)
+            # Subtle warm polish on worn high crests
+            crest_col = np.clip(alb_lin * 1.22 + 0.04, 0.0, 0.94)
+            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.32) + crest_col * (edge_scuff[..., None] * 0.32)
+            # Crisp metallic stripping on oxidized crust (dielectric patina/oxide)
+            ox_cut = np.clip((patina - 0.28) / 0.18, 0.0, 1.0)
+            ox_cut = ox_cut * ox_cut * (3.0 - 2.0 * ox_cut)
+            met_f = np.clip(met_f * (1.0 - ox_cut * 0.96), 0.0, 1.0).astype(np.float32)
+            rough = np.clip(rough * (1.0 - patina) + np.clip(0.78 + 0.14 * w_fine, 0.68, 0.95) * patina - 0.12 * edge_scuff * met_f, 0.08, 0.97).astype(np.float32)
+        else:
+            grime_col = np.array([0.065, 0.060, 0.052], dtype=np.float32)[None, None, :]
+            scuff_col = np.clip(alb_lin * 1.28 + 0.08, 0.0, 0.90)
+            alb_lin = alb_lin * (1.0 - patina[..., None] * 0.72) + grime_col * (patina[..., None] * 0.72)
+            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.42) + scuff_col * (edge_scuff[..., None] * 0.42)
+            rough = np.clip(rough + 0.32 * patina + 0.16 * edge_scuff + 0.06 * w_amt * w_fine, 0.08, 0.97).astype(np.float32)
+
         alb_u8 = np.clip(np.power(np.clip(alb_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
-        # Cavities get rougher & oxidized; metallic crests slightly polish while dielectric edges scuff
-        rough = np.clip(rough + 0.28 * grime + (0.14 * (1.0 - met_f) - 0.10 * met_f) * edge_scuff + 0.06 * w_amt * w_noise, 0.08, 0.97).astype(np.float32)
-        met_f = np.clip(met_f * (1.0 - 0.55 * grime), 0.0, 1.0).astype(np.float32)
         met_u8 = np.clip(met_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": N}, strength=0.25, max_boost=0.08)["roughness"]
-
-    L1 = np.array([0.48, 0.52, 0.71], np.float32); L1 /= np.linalg.norm(L1)
-    L2 = np.array([-0.60, -0.30, 0.74], np.float32); L2 /= np.linalg.norm(L2)
-    H1 = L1 + np.array([0.0, 0.0, 1.0], np.float32); H1 /= np.linalg.norm(H1)
-    ndotl1 = np.clip((N * L1[None, None, :]).sum(-1), 0.0, 1.0)
-    ndotl2 = np.clip((N * L2[None, None, :]).sum(-1), 0.0, 1.0)
-    ndoth1 = np.clip((N * H1[None, None, :]).sum(-1), 0.0, 1.0)
-    shin = np.clip(2.0 / (np.maximum(rough, 0.08) ** 2.4) - 2.0, 2.0, 180.0)
-    spec_col = (1.0 - met_f[..., None]) * 0.8 + met_f[..., None] * alb_lin
-    spec = (ndoth1 ** shin)[..., None] * (1.0 - rough[..., None] * 0.80) * 0.75 * spec_col
-    col = alb_lin * (0.18 + 0.80 * ndotl1[..., None] + 0.22 * ndotl2[..., None]) * (0.28 + 0.72 * ao[..., None]) + spec * (0.35 + 0.65 * ao[..., None])
-    prev_u8 = np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao)
 
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface({"circular": True}, {"height": h_n})
     rough_u8 = np.clip(rough * 255.0 + 0.5, 0, 255).astype(np.uint8)
     orm_u8 = np.stack([hbao["ao_u8"], rough_u8, met_u8], axis=-1)
 
-    Image.fromarray(alb_u8).save(d / "albedo_delit.png")
-    Image.fromarray(prev_u8).save(d / "preview.png")
-    Image.fromarray(np.clip(h_n * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(d / "height.png")
-    Image.fromarray(np.clip(h_n * 65535.0 + 0.5, 0, 65535).astype(np.uint16)).save(d / "height16.png")
-    Image.fromarray(dp.normal_to_u8(N)).save(d / "normal.png")
-    Image.fromarray(hbao["bent_normal_u8"]).save(d / "bent_normal.png")
-    Image.fromarray(hbao["ao_u8"]).save(d / "ao.png")
-    Image.fromarray(rough_u8).save(d / "roughness.png")
-    Image.fromarray(met_u8).save(d / "metallic.png")
-    Image.fromarray(orm_u8).save(d / "orm.png")
-    Image.fromarray(curv["curvature_u8"]).save(d / "curvature.png")
-    Image.fromarray(curv["cavity_u8"]).save(d / "cavity.png")
-    Image.fromarray(np.clip(curv["convex"] * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(d / "edge_wear.png")
-    Image.fromarray(aniso["anisotropy_u8"]).save(d / "anisotropy.png")
-    Image.fromarray(aniso["specular_u8"]).save(d / "specular.png")
-    Image.fromarray(thick["thickness_u8"]).save(d / "thickness.png")
+    save_maps_parallel([
+        (d / "albedo_delit.png", alb_u8),
+        (d / "preview.png", prev_u8),
+        (d / "height.png", np.clip(h_n * 255.0 + 0.5, 0, 255).astype(np.uint8)),
+        (d / "height16.png", np.clip(h_n * 65535.0 + 0.5, 0, 65535).astype(np.uint16)),
+        (d / "normal.png", dp.normal_to_u8(N)),
+        (d / "bent_normal.png", hbao["bent_normal_u8"]),
+        (d / "ao.png", hbao["ao_u8"]),
+        (d / "roughness.png", rough_u8),
+        (d / "metallic.png", met_u8),
+        (d / "orm.png", orm_u8),
+        (d / "curvature.png", curv["curvature_u8"]),
+        (d / "cavity.png", curv["cavity_u8"]),
+        (d / "edge_wear.png", np.clip(curv["convex"] * 255.0 + 0.5, 0, 255).astype(np.uint8)),
+        (d / "anisotropy.png", aniso["anisotropy_u8"]),
+        (d / "specular.png", aniso["specular_u8"]),
+        (d / "thickness.png", thick["thickness_u8"]),
+    ])
     return d
 
 

@@ -23,7 +23,10 @@ def test_wear_weathering_is_seamless_and_modulates_roughness(tmp_path: Path) -> 
 
     r_fresh = np.asarray(Image.open(fresh / "roughness.png"), dtype=np.float32).mean()
     r_worn = np.asarray(Image.open(worn / "roughness.png"), dtype=np.float32).mean()
-    assert r_worn > r_fresh
+    m_fresh = np.asarray(Image.open(fresh / "metallic.png"), dtype=np.float32).mean()
+    m_worn = np.asarray(Image.open(worn / "metallic.png"), dtype=np.float32).mean()
+    assert r_worn > r_fresh + 40.0
+    assert m_worn < m_fresh - 60.0  # dielectric verdigris/oxide crust strips metallic cleanly
 
 
 def test_height_lerp_and_cavity_blend_pass_verify(tmp_path: Path) -> None:

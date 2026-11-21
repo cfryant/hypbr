@@ -199,16 +199,23 @@ def blend_rnm(n_base: np.ndarray, n_detail: np.ndarray, detail_weight: float = 0
     return (r / (np.linalg.norm(r, axis=-1, keepdims=True) + 1e-8)).astype(np.float32)
 
 
+def _fast_percentiles(arr: np.ndarray, qs: tuple[float, ...]) -> tuple[float, ...]:
+    """Fast robust percentiles using uniform strided subsampling above 262K elements."""
+    flat = np.asarray(arr, dtype=np.float32).ravel()
+    stride = max(1, flat.size // 262144)
+    vals = np.percentile(flat[::stride], qs)
+    return tuple(float(v) for v in vals)
+
+
 def normalize_height(h: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
-    lo = np.percentile(h, clip_pct)
-    hi = np.percentile(h, 100.0 - clip_pct)
+    lo, hi = _fast_percentiles(h, (clip_pct, 100.0 - clip_pct))
     if hi - lo < 1e-6:
         return np.full_like(h, 0.5, dtype=np.float32)
     return np.clip((h - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
 
 
 def height_to_unit_normal(h: np.ndarray, strength: float = 2.4, flip_y: bool = False, circular: bool = False) -> np.ndarray:
-    p5, p95 = np.percentile(h, 3), np.percentile(h, 97)
+    p5, p95 = _fast_percentiles(h, (3.0, 97.0))
     if p95 - p5 < 1e-6:
         out = np.zeros(h.shape + (3,), dtype=np.float32)
         out[..., 2] = 1.0

@@ -776,16 +776,18 @@ def node_micro_grain(
     base_n = inputs["normal"]
     H, W = base_n.shape[:2]
     rng = np.random.default_rng(int(seed))
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32) / float(W)
-    th = math.radians(float(angle_deg))
-    rx = math.cos(th) * xx - math.sin(th) * yy
-    ry = math.sin(th) * xx + math.cos(th) * yy
-
     if kind == "brushed":
-        # Anisotropic fine machined brush lines
+        # Anisotropic fine machined brush lines (lightweight float32 1D broadcast)
         g = rng.standard_normal((max(8, int(scale * 4)), max(4, int(scale * 0.35)))).astype(np.float32)
         t = F.interpolate(torch.from_numpy(g)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
-        grain = 0.65 * t + 0.35 * np.sin(ry * float(scale) * 24.0)
+        th = math.radians(float(angle_deg))
+        yy_1d = np.arange(H, dtype=np.float32) / float(W)
+        if abs(th) < 1e-5:
+            grain = 0.65 * t + 0.35 * np.sin(yy_1d * float(scale) * 24.0)[:, None]
+        else:
+            xx_1d = np.arange(W, dtype=np.float32) / float(W)
+            ry = math.sin(th) * xx_1d[None, :] + math.cos(th) * yy_1d[:, None]
+            grain = 0.65 * t + 0.35 * np.sin(ry * float(scale) * 24.0)
     elif kind == "cast":
         # Cast-iron stipple (two-octave periodic fbm)
         g1 = rng.standard_normal((max(8, int(scale)), max(8, int(scale)))).astype(np.float32)
@@ -1284,7 +1286,7 @@ def node_horizon_bent_normal_ao(
     inputs: dict,
     strength: float = 1.45,
     height_scale: float = 18.0,
-    radii: tuple[int, ...] = (1, 2, 4, 8, 14, 24),
+    radii: tuple[int, ...] = (1, 2, 4, 8, 16, 28, 44),
     **_,
 ):
     """V13 True 8-Azimuth Horizon-Based Ambient Occlusion (HBAO/GTAO) + Tangent-Space Bent Normal.
@@ -1296,6 +1298,7 @@ def node_horizon_bent_normal_ao(
     N = inputs["normal"].astype(np.float32) if "normal" in inputs and inputs["normal"] is not None else None
     H, W = h.shape
     hs = float(height_scale)
+    eff_radii = tuple(r for r in radii if r < max(2, min(H, W) // 2)) or (1,)
 
     dirs = [
         (1, 0), (-1, 0), (0, 1), (0, -1),
@@ -1306,36 +1309,36 @@ def node_horizon_bent_normal_ao(
         with torch.no_grad():
             dev = dp.DEVICE
             ht = torch.from_numpy(np.ascontiguousarray(h, dtype=np.float32)).to(dev)
-            ao_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
-            bx_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
-            by_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
-            bz_t = torch.zeros((H, W), dtype=torch.float32, device=dev)
-            max_r = max(radii)
+            max_r = max(eff_radii)
             pad_mode = "circular" if circ else "replicate"
             ht_pad = F.pad(ht[None, None], (max_r, max_r, max_r, max_r), mode=pad_mode)[0, 0]
 
-            for dx, dy in dirs:
-                step_len = math.hypot(dx, dy)
-                ux, uy = dx / step_len, dy / step_len
-                max_sin_h = torch.zeros((H, W), dtype=torch.float32, device=dev)
-                for r in radii:
-                    sx, sy = int(round(dx * r)), int(round(dy * r))
-                    h_s = ht_pad[max_r + sy:max_r + sy + H, max_r + sx:max_r + sx + W]
-                    dh = (h_s - ht) * hs
-                    dist = float(r) * step_len
-                    sin_h = dh * torch.rsqrt(dh * dh + (dist * dist + 1e-6))
-                    falloff = 1.0 / (1.0 + 0.045 * dist)
-                    max_sin_h = torch.maximum(max_sin_h, torch.clamp(sin_h, 0.0, 0.98) * falloff)
+            step_lens = torch.tensor([math.hypot(dx, dy) for dx, dy in dirs], dtype=torch.float32, device=dev)[:, None, None]
+            ux = torch.tensor([dx / math.hypot(dx, dy) for dx, dy in dirs], dtype=torch.float32, device=dev)[:, None, None]
+            uy = torch.tensor([dy / math.hypot(dx, dy) for dx, dy in dirs], dtype=torch.float32, device=dev)[:, None, None]
 
-                vis = 1.0 - max_sin_h
-                ao_t += vis
-                cos_h = torch.sqrt(torch.clamp(1.0 - max_sin_h * max_sin_h, min=0.0))
-                bx_t += ux * vis * cos_h * 0.55
-                by_t += (-uy) * vis * cos_h * 0.55
-                bz_t += vis * (0.45 + 0.55 * cos_h)
+            max_sin_h = torch.zeros((len(dirs), H, W), dtype=torch.float32, device=dev)
+            ht_b = ht[None, :, :]
+            for r in eff_radii:
+                h_s = torch.stack([
+                    ht_pad[max_r + int(round(dy * r)):max_r + int(round(dy * r)) + H,
+                           max_r + int(round(dx * r)):max_r + int(round(dx * r)) + W]
+                    for dx, dy in dirs
+                ], dim=0)
+                dh = (h_s - ht_b) * hs
+                dist = float(r) * step_lens
+                sin_h = dh * torch.rsqrt(dh * dh + (dist * dist + 1e-6))
+                falloff = 1.0 / (1.0 + 0.025 * dist)
+                max_sin_h = torch.maximum(max_sin_h, torch.clamp(sin_h, 0.0, 0.98) * falloff)
 
-            ao_raw = torch.clamp(ao_t / float(len(dirs)), 0.0, 1.0)
+            vis = 1.0 - max_sin_h
+            ao_raw = torch.clamp(vis.mean(dim=0), 0.0, 1.0)
             ao_f = torch.clamp(1.0 - float(strength) * (1.0 - ao_raw), 0.08, 1.0)
+            cos_h = torch.sqrt(torch.clamp(1.0 - max_sin_h * max_sin_h, min=0.0))
+            vc = vis * cos_h
+            bx_t = (ux * vc * 0.55).sum(dim=0)
+            by_t = ((-uy) * vc * 0.55).sum(dim=0)
+            bz_t = (vis * (0.45 + 0.55 * cos_h)).sum(dim=0)
             bent_t = torch.stack([bx_t, by_t, torch.clamp(bz_t, min=0.15)], dim=-1)
             bent_t = bent_t / (torch.linalg.norm(bent_t, dim=-1, keepdim=True) + 1e-8)
             if N is not None:
@@ -1355,7 +1358,7 @@ def node_horizon_bent_normal_ao(
             step_len = math.hypot(dx, dy)
             ux, uy = dx / step_len, dy / step_len
             max_sin_h = np.zeros((H, W), dtype=np.float32)
-            for r in radii:
+            for r in eff_radii:
                 sx, sy = int(round(dx * r)), int(round(dy * r))
                 if circ:
                     h_s = np.roll(np.roll(h, -sy, axis=0), -sx, axis=1)
@@ -1368,7 +1371,7 @@ def node_horizon_bent_normal_ao(
                 dist = float(r) * step_len
                 sin_h = dh / np.sqrt(dh * dh + dist * dist + 1e-6)
                 # Distance falloff so distant macro hills don't over-darken micro crevices
-                falloff = 1.0 / (1.0 + 0.045 * dist)
+                falloff = 1.0 / (1.0 + 0.025 * dist)
                 max_sin_h = np.maximum(max_sin_h, np.clip(sin_h, 0.0, 0.98) * falloff)
 
             # Visibility along this azimuth = 1 - sin(horizon_angle)
@@ -1476,18 +1479,22 @@ def node_curvature_multiscale(
     for idx, (sig, w) in enumerate(zip(sigmas, weights)):
         ps = dp.gaussian_blur_np(p, float(sig), circular=circ) if sig > 0.3 else p
         qs = dp.gaussian_blur_np(q, float(sig), circular=circ) if sig > 0.3 else q
-        dpdx = np.gradient(ps, axis=1)
-        dqdy = np.gradient(qs, axis=0)
+        if circ:
+            dpdx = 0.5 * (np.roll(ps, -1, axis=1) - np.roll(ps, 1, axis=1))
+            dqdy = 0.5 * (np.roll(qs, -1, axis=0) - np.roll(qs, 1, axis=0))
+        else:
+            dpdx = np.gradient(ps, axis=1)
+            dqdy = np.gradient(qs, axis=0)
         # Positive divergence = convex ridge, negative = concave valley
         curv_s = -(dpdx - dqdy) * 0.5
         div_acc += float(w) * curv_s
         if idx == 0:
             fine_conc = np.maximum(0.0, -curv_s)
 
-    # Adaptive Substance-style contrast: normalize by robust 97th-percentile curvature so both subtle stone & deep tiles pop
-    p97 = float(np.percentile(np.abs(div_acc), 97))
-    eff_gain = float(gain) * (0.38 / max(p97, 0.04))
-    signed = np.clip(0.5 + 0.5 * np.tanh(div_acc * eff_gain), 0.0, 1.0).astype(np.float32)
+    # Adaptive Substance-style contrast with gentle p98 highlight roll-off to avoid micro-pit white halos
+    p98 = float(np.percentile(np.abs(div_acc), 98))
+    eff_gain = float(gain) * (0.28 / max(p98, 0.04))
+    signed = np.clip(0.5 + 0.46 * np.tanh(div_acc * eff_gain), 0.0, 1.0).astype(np.float32)
     convex = np.clip((signed - 0.5) * 2.0, 0.0, 1.0).astype(np.float32)
     concave = np.clip((0.5 - signed) * 2.0, 0.0, 1.0).astype(np.float32)
 

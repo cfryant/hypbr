@@ -16,6 +16,8 @@ from PIL import Image
 
 from . import depthpro_pbr as dp
 from . import normal_graph as ng
+from . import procedural as gd
+from .synthesize import render_studio_preview, save_maps_parallel
 
 
 def _load_srgb_linear(path: Path, size: tuple[int, int]) -> np.ndarray:
@@ -64,33 +66,37 @@ def compute_height_blend_mask(
     h_a: np.ndarray,
     h_b: np.ndarray,
     factor: float = 0.5,
-    contrast: float = 0.15,
+    contrast: float = 0.12,
     mode: str = "height",
 ) -> np.ndarray:
-    """Compute smooth blend weight `m in [0, 1]` selecting material B over material A.
+    """Compute organic, C1-smooth HeightLerp blend weight `m in [0, 1]` selecting material B over A.
 
-    - `mode="height"`: Unreal/Substance HeightLerp — material B fills or rises where
-      `h_b + factor` exceeds `h_a + (1 - factor)`, with transition sharpness controlled by `contrast`.
-    - `mode="cavity"`: Material B settles preferentially into crevices/low regions of A.
+    - `mode="height"`: Unreal/Substance HeightLerp — material B rises where
+      `h_b + factor` exceeds `h_a + (1 - factor)`, with organic micro-fracture breakup.
+    - `mode="cavity"`: Material B settles preferentially into crevices/valleys of A,
+      modulated by material B's height and periodic micro-variation to avoid uniform blobs.
     - `mode="linear"`: Uniform scalar blend `m = factor`.
     """
     f = float(np.clip(factor, 0.0, 1.0))
     c = max(float(contrast), 1e-3)
     if mode == "linear":
         return np.full_like(h_a, f, dtype=np.float32)
+
+    H, W = h_a.shape
+    # Seamless organic edge breakup prevents artificial uniform blobs on regular patterns
+    breakup = gd._periodic_fbm(H, W, 9137, (6, 12, 24, 48)) * 0.14
     if mode == "cavity":
-        # Low height of A + high height of B favors B
-        score = (1.0 - h_a) * 0.65 + h_b * 0.35 + (f * 2.0 - 1.0)
+        # Low valleys of A + high relief of B + organic breakup favors B
+        score = (1.0 - h_a) * 0.55 + h_b * 0.45 + breakup + (f * 1.4 - 0.7)
         m = np.clip((score - 0.5) / c + 0.5, 0.0, 1.0)
     elif mode == "height":
-        # Classic HeightLerp: compare biased heightfields
         ma = h_a + (1.0 - f)
-        mb = h_b + f
+        mb = h_b + f + breakup
         diff = mb - ma
         m = np.clip(diff / c + 0.5, 0.0, 1.0)
     else:
         raise ValueError(f"Unknown blend mode {mode!r}. Choose 'height', 'cavity', or 'linear'.")
-    # Smoothstep for C1-continuous transitions without hard stepping
+    # Smoothstep for crisp yet anti-aliased transitions
     return (m * m * (3.0 - 2.0 * m)).astype(np.float32)
 
 
@@ -99,7 +105,7 @@ def blend_materials(
     dir_b: Path | str,
     out_dir: Path | str,
     factor: float = 0.5,
-    contrast: float = 0.15,
+    contrast: float = 0.09,
     mode: str = "height",
 ) -> Path:
     """Physically blend two hypbr material directories into a new seamless 15-map directory."""
@@ -112,29 +118,44 @@ def blend_materials(
     h_a = _load_height_f32(pa, size)
     h_b = _load_height_f32(pb, size)
     mask = compute_height_blend_mask(h_a, h_b, factor=factor, contrast=contrast, mode=mode)
-    m3 = mask[..., None]
 
-    # 1. Linear-light albedo blend
+    # Unified crisp physical boundary mask so albedo, roughness, and metallic share clean edges
+    # without semi-metallic gray halos or muddy/cyan transition fringes.
+    if mode == "linear":
+        surf_mask = mask
+        met_mask = mask
+    else:
+        sm = np.clip((mask - 0.5) / 0.24 + 0.5, 0.0, 1.0)
+        surf_mask = (sm * sm * (3.0 - 2.0 * sm)).astype(np.float32)
+        mm = np.clip((mask - 0.5) / 0.16 + 0.5, 0.0, 1.0)
+        met_mask = (mm * mm * (3.0 - 2.0 * mm)).astype(np.float32)
+    m3 = surf_mask[..., None]
+
+    # 1. Linear-light albedo blend + subtle contact darkening at overlay rim
     alb_a = _load_srgb_linear(pa / "albedo_delit.png", size)
     alb_b = _load_srgb_linear(pb / "albedo_delit.png", size)
-    alb_lin = (1.0 - m3) * alb_a + m3 * alb_b
+    rim_band = 4.0 * surf_mask * (1.0 - surf_mask)  # peaks at 1.0 along material boundary
+    alb_lin = ((1.0 - m3) * alb_a + m3 * alb_b) * (1.0 - 0.10 * rim_band[..., None])
     alb_u8 = np.clip(np.power(np.clip(alb_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    # 2. Height & slope-consistent normal blend
-    h_out = dp.normalize_height((1.0 - mask) * h_a + mask * h_b, clip_pct=0.5)
+    # 2. Height & slope-consistent normal blend with physical transition bevel
+    h_blend = (1.0 - surf_mask) * h_a + surf_mask * (h_b + (0.04 if mode == "height" else 0.0))
+    h_out = dp.normalize_height(h_blend, clip_pct=0.5)
     n_a = _load_normal_f32(pa / "normal.png", size)
     n_b = _load_normal_f32(pb / "normal.png", size)
-    n_out = ng.normalize_n((1.0 - m3) * n_a + m3 * n_b)
+    n_lip = gd._height_to_normal_periodic(surf_mask, slope=0.35 if mode != "linear" else 0.0)
+    n_mix = ng.normalize_n((1.0 - m3) * n_a + m3 * n_b)
+    n_out = ng.normalize_n(np.stack([n_mix[..., 0] + n_lip[..., 0] * 0.45, n_mix[..., 1] + n_lip[..., 1] * 0.45, np.maximum(n_mix[..., 2], 0.15)], axis=-1))
 
-    # 3. Roughness (with Specular AA) & Metallic
+    # 3. Roughness (with Specular AA) & crisp physical Metallic
     r_a = _load_gray_f32(pa / "roughness.png", size, 0.5)
     r_b = _load_gray_f32(pb / "roughness.png", size, 0.5)
-    rough = np.clip((1.0 - mask) * r_a + mask * r_b, 0.06, 0.98).astype(np.float32)
+    rough = np.clip((1.0 - surf_mask) * r_a + surf_mask * r_b + 0.06 * rim_band, 0.06, 0.98).astype(np.float32)
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": n_out}, strength=0.2, max_boost=0.06)["roughness"]
 
     met_a = _load_gray_f32(pa / "metallic.png", size, 0.0)
     met_b = _load_gray_f32(pb / "metallic.png", size, 0.0)
-    met = np.clip((1.0 - mask) * met_a + mask * met_b, 0.0, 1.0).astype(np.float32)
+    met = np.clip((1.0 - met_mask) * met_a + met_mask * met_b, 0.0, 1.0).astype(np.float32)
     met_u8 = np.clip(met * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
     # 4. Recompute physical 8-azimuth HBAO + bent normal + curvature + anisotropy + thickness
@@ -146,34 +167,26 @@ def blend_materials(
     rough_u8 = np.clip(rough * 255.0 + 0.5, 0, 255).astype(np.uint8)
     orm_u8 = np.stack([hbao["ao_u8"], rough_u8, met_u8], axis=-1)
 
-    # 5. Shaded studio preview
-    L1 = np.array([0.48, 0.52, 0.71], np.float32); L1 /= np.linalg.norm(L1)
-    L2 = np.array([-0.60, -0.30, 0.74], np.float32); L2 /= np.linalg.norm(L2)
-    H1 = L1 + np.array([0.0, 0.0, 1.0], np.float32); H1 /= np.linalg.norm(H1)
-    ndotl1 = np.clip((n_out * L1[None, None, :]).sum(-1), 0.0, 1.0)
-    ndotl2 = np.clip((n_out * L2[None, None, :]).sum(-1), 0.0, 1.0)
-    ndoth1 = np.clip((n_out * H1[None, None, :]).sum(-1), 0.0, 1.0)
-    shin = np.clip(2.0 / (np.maximum(rough, 0.08) ** 2.4) - 2.0, 2.0, 180.0)
-    spec_col = (1.0 - met[..., None]) * 0.8 + met[..., None] * alb_lin
-    spec = (ndoth1 ** shin)[..., None] * (1.0 - rough[..., None] * 0.80) * 0.75 * spec_col
-    col = alb_lin * (0.18 + 0.80 * ndotl1[..., None] + 0.22 * ndotl2[..., None]) * (0.28 + 0.72 * ao[..., None]) + spec * (0.35 + 0.65 * ao[..., None])
-    prev_u8 = np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    # 5. Physically-based studio preview (with metallic Fresnel IBL)
+    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao)
 
-    Image.fromarray(alb_u8).save(out / "albedo_delit.png")
-    Image.fromarray(prev_u8).save(out / "preview.png")
-    Image.fromarray(np.clip(h_out * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(out / "height.png")
-    Image.fromarray(np.clip(h_out * 65535.0 + 0.5, 0, 65535).astype(np.uint16)).save(out / "height16.png")
-    Image.fromarray(dp.normal_to_u8(n_out)).save(out / "normal.png")
-    Image.fromarray(hbao["bent_normal_u8"]).save(out / "bent_normal.png")
-    Image.fromarray(hbao["ao_u8"]).save(out / "ao.png")
-    Image.fromarray(rough_u8).save(out / "roughness.png")
-    Image.fromarray(met_u8).save(out / "metallic.png")
-    Image.fromarray(orm_u8).save(out / "orm.png")
-    Image.fromarray(curv["curvature_u8"]).save(out / "curvature.png")
-    Image.fromarray(curv["cavity_u8"]).save(out / "cavity.png")
-    Image.fromarray(np.clip(curv["convex"] * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(out / "edge_wear.png")
-    Image.fromarray(aniso["anisotropy_u8"]).save(out / "anisotropy.png")
-    Image.fromarray(aniso["specular_u8"]).save(out / "specular.png")
-    Image.fromarray(thick["thickness_u8"]).save(out / "thickness.png")
-    Image.fromarray(np.clip(mask * 255.0 + 0.5, 0, 255).astype(np.uint8)).save(out / "blend_mask.png")
+    save_maps_parallel([
+        (out / "albedo_delit.png", alb_u8),
+        (out / "preview.png", prev_u8),
+        (out / "height.png", np.clip(h_out * 255.0 + 0.5, 0, 255).astype(np.uint8)),
+        (out / "height16.png", np.clip(h_out * 65535.0 + 0.5, 0, 65535).astype(np.uint16)),
+        (out / "normal.png", dp.normal_to_u8(n_out)),
+        (out / "bent_normal.png", hbao["bent_normal_u8"]),
+        (out / "ao.png", hbao["ao_u8"]),
+        (out / "roughness.png", rough_u8),
+        (out / "metallic.png", met_u8),
+        (out / "orm.png", orm_u8),
+        (out / "curvature.png", curv["curvature_u8"]),
+        (out / "cavity.png", curv["cavity_u8"]),
+        (out / "edge_wear.png", np.clip(curv["convex"] * 255.0 + 0.5, 0, 255).astype(np.uint8)),
+        (out / "anisotropy.png", aniso["anisotropy_u8"]),
+        (out / "specular.png", aniso["specular_u8"]),
+        (out / "thickness.png", thick["thickness_u8"]),
+        (out / "blend_mask.png", np.clip(surf_mask * 255.0 + 0.5, 0, 255).astype(np.uint8)),
+    ])
     return out

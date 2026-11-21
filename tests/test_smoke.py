@@ -67,3 +67,31 @@ def test_gpu_cpu_parity_hbao_and_blur() -> None:
     assert np.allclose(g_blur, c_blur, atol=1e-4)
     assert np.allclose(g_hbao["ao"], c_hbao["ao"], atol=1e-4)
     assert np.allclose(g_hbao["bent_normal"], c_hbao["bent_normal"], atol=1e-4)
+
+
+def test_gpu_cpu_parity_periodic_fbm_and_preview() -> None:
+    import numpy as np
+    import torch
+    from hypbr import depthpro_pbr as dp
+    from hypbr import procedural as gd
+    from hypbr.synthesize import render_studio_preview
+
+    g_fbm = gd._periodic_fbm(512, 512, 1234, (4, 8, 16, 32))
+    alb = np.full((512, 512, 3), 0.55, dtype=np.float32)
+    N = np.zeros((512, 512, 3), dtype=np.float32)
+    N[..., 2] = 1.0
+    rgh = np.full((512, 512), 0.32, dtype=np.float32)
+    met = np.full((512, 512), 0.85, dtype=np.float32)
+    ao = np.full((512, 512), 0.90, dtype=np.float32)
+    g_prev = render_studio_preview(alb, N, rgh, met, ao)
+
+    old_dev = dp.DEVICE
+    try:
+        dp.DEVICE = torch.device("cpu")
+        c_fbm = gd._periodic_fbm(512, 512, 1234, (4, 8, 16, 32))
+        c_prev = render_studio_preview(alb, N, rgh, met, ao)
+    finally:
+        dp.DEVICE = old_dev
+
+    assert np.allclose(g_fbm, c_fbm, atol=1e-3)
+    assert int(np.max(np.abs(g_prev.astype(int) - c_prev.astype(int)))) <= 1
