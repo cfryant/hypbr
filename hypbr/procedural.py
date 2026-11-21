@@ -196,11 +196,11 @@ DAILY_CATALOG = [
     ("waffle_radiator_fins",     "Apartment cast-iron radiator / HVAC vent fins with rounded ribs",        "metal",   (0.76, 0.75, 0.72)),
     ("wood_parquet_herringbone", "Oak herringbone parquet floorboards with micro-bevel seams & wood grain","wood",    (0.56, 0.40, 0.26)),
     ("carbon_fiber_weave",       "2x2 twill carbon-fiber tech weave with crisp over-under tow relief",     "carbon",  (0.18, 0.19, 0.21)),
-    ("street_storm_grate",       "Street cast-iron storm-drain trench grate with staggered beveled slots", "metal",   (0.30, 0.31, 0.33)),
+    ("street_storm_grate",       "Street cast-iron storm-drain trench grate with staggered beveled slots", "metal",   (0.46, 0.48, 0.51)),
     ("diamond_tread_plate",      "Industrial/subway steel diamond checkerplate with alternating raised bars","metal", (0.50, 0.53, 0.56)),
     ("hvac_slotted_vent",        "Stamped architectural HVAC return-air louver vent grille with ribs",     "metal",   (0.68, 0.69, 0.68)),
     # --- 13 New Small-Scale Vents, Grilles, Plates, Meshes & Micro-Treads ---
-    ("speaker_mesh_hex",         "Fine hexagonal perforated speaker / intercom / laptop mesh grille",      "metal",   (0.24, 0.25, 0.28)),
+    ("speaker_mesh_hex",         "Fine hexagonal perforated speaker / intercom / laptop mesh grille",      "metal",   (0.50, 0.53, 0.57)),
     ("expanded_metal_mesh",      "Diamond expanded-metal security screen & industrial walkway mesh",       "metal",   (0.42, 0.44, 0.46)),
     ("stamped_louver_micro",     "Fine stamped electronics / power-box cooling louver slot array",         "metal",   (0.36, 0.38, 0.40)),
     ("chainlink_wire_mesh",      "Tight woven galvanized wire mesh screen with over-under crossings",      "metal",   (0.56, 0.58, 0.60)),
@@ -230,7 +230,7 @@ DAILY_CATALOG = [
     ("pcb_solder_mask_traces",   "Electronics PCB surface with parallel copper traces & micro-vias",       "ceramic", (0.12, 0.34, 0.22)),
     ("acoustic_pyramid_foam",    "Studio/packaging convoluted acoustic pyramid foam micro-peaks",          "rubber",  (0.18, 0.19, 0.21)),
     ("terry_velcro_loops",       "Fine micro-looped hook-and-loop / terry textile surface",                "fabric",  (0.58, 0.54, 0.48)),
-    ("reeded_coin_milling",      "Ultra-fine milled coin-edge / watch-bezel parallel micro-reeding",       "metal",   (0.92, 0.76, 0.34)),
+    ("reeded_coin_milling",      "Ultra-fine milled coin-edge / watch-bezel parallel micro-reeding",       "metal",   (0.95, 0.68, 0.24)),
     # --- 12 New Material Categories (Glass, Terrazzo, Rattan, Cork, Hammered Copper, Knit Wool, Mosaics, Asphalt, Plaster, Felt) ---
     ("fluted_reeded_glass",      "Architectural vertical fluted/reeded privacy glass ribs",                "glass",   (0.78, 0.86, 0.85)),
     ("terrazzo_speckled_stone",  "Honed terrazzo cement with multi-colored angular marble aggregate",      "stone",   (0.76, 0.74, 0.70)),
@@ -289,7 +289,7 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         h = np.clip(pyr * 1.35, 0.0, 0.82)
         cav = _smoothstep(0.28, 0.02, h)
         ridge = _smoothstep(0.65, 0.82, h)
-        return h, 22.0, cav, 0.28, ridge
+        return h, 14.0, cav, 0.28, ridge
 
     if detail_id == "woven_denim_twill":
         # Authentic fine 3x1 diagonal jeans denim twill: dense 56x56 subtle indigo warp & fine diagonal twill cords (ZERO chunky tweed blocks!)
@@ -473,7 +473,7 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         h = 0.06 + 0.80 * bar + crown * bar
         cav = 1.0 - bar
         ridge = _smoothstep(0.04, 0.14, d_slot) * (1.0 - _smoothstep(0.14, 0.26, d_slot))
-        return h.astype(np.float32), 21.0, cav.astype(np.float32), 0.44, ridge.astype(np.float32)
+        return h.astype(np.float32), 18.0, cav.astype(np.float32), 0.28, ridge.astype(np.float32)
 
     if detail_id == "diamond_tread_plate":
         # Classic street/subway steel diamond checkerplate (alternating perpendicular raised lozenge bars)
@@ -523,7 +523,7 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         h = 0.06 + 0.84 * web
         cav = 1.0 - web
         ridge = _smoothstep(0.36, 0.44, d_hex)
-        return h.astype(np.float32), 20.0, cav.astype(np.float32), 0.32, ridge.astype(np.float32)
+        return h.astype(np.float32), 18.0, cav.astype(np.float32), 0.22, ridge.astype(np.float32)
 
     if detail_id == "expanded_metal_mesh":
         # Stretched diamond expanded-metal mesh with slight twist-angle strand relief
@@ -657,7 +657,7 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         h = 0.24 + 0.58 * np.maximum(ribs, dots)
         cav = _smoothstep(0.32, 0.24, h)
         ridge = np.maximum(ribs, dots)
-        return h.astype(np.float32), 20.0, cav.astype(np.float32), 0.30, ridge.astype(np.float32)
+        return h.astype(np.float32), 18.0, cav.astype(np.float32), 0.22, ridge.astype(np.float32)
 
     if detail_id == "stamped_vent_slots_stagger":
         # Staggered rounded-pill ventilation slots on street transformer / utility boxes
@@ -765,14 +765,15 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         return h.astype(np.float32), 14.0, cav.astype(np.float32), 0.38, ridge.astype(np.float32)
 
     if detail_id == "stair_nosing_grooves":
-        # Machined aluminum anti-slip stair-nosing: alternating smooth metal ribs & coarse grit channels
+        # Machined aluminum anti-slip stair-nosing: clean extruded ribs & fine parallel micro-serrated channels
         t = (v * 10.0) % 1.0
         rib = np.minimum(_smoothstep(0.06, 0.14, t), 1.0 - _smoothstep(0.42, 0.50, t))
-        grit = 0.08 * _periodic_fbm(H, W, seed + 55, (32, 64)) * (1.0 - rib)
-        h = 0.24 + 0.64 * rib + grit
+        # Fine 1D extruded micro-serrations inside each anti-slip channel (zero crumpled FBM distortion)
+        serr = (0.5 + 0.5 * np.sin(2.0 * math.pi * v * 120.0)) * (1.0 - rib)
+        h = 0.22 + 0.66 * rib + 0.045 * serr
         cav = 1.0 - rib
         ridge = _smoothstep(0.85, 0.99, rib)
-        return h.astype(np.float32), 20.0, cav.astype(np.float32), 0.30, ridge.astype(np.float32)
+        return h.astype(np.float32), 14.0, cav.astype(np.float32), 0.22, ridge.astype(np.float32)
 
     if detail_id == "heatsink_extrusion_fins":
         # Extruded anodized aluminum heatsink cooling fins (8 bold symmetric precision fins -> zero aliasing/barcode!)
@@ -950,10 +951,10 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
     if detail_id == "reeded_coin_milling":
         # Crisp bright milled golden-brass coin-edge ridges (20 band-limited flutes -> gleaming metallic sheen!)
         t = 0.5 + 0.5 * np.cos(2.0 * math.pi * u * 20.0)
-        h = 0.18 + 0.70 * (t ** 0.72)
-        cav = 1.0 - t
-        ridge = _smoothstep(0.74, 0.98, t)
-        return h.astype(np.float32), 14.0, cav.astype(np.float32), 0.13, ridge.astype(np.float32)
+        h = 0.14 + 0.76 * (t ** 0.58)
+        cav = _smoothstep(0.45, 0.0, t)
+        ridge = _smoothstep(0.68, 0.98, t)
+        return h.astype(np.float32), 16.0, cav.astype(np.float32), 0.08, ridge.astype(np.float32)
 
     if detail_id == "fluted_reeded_glass":
         # Architectural vertical fluted privacy glass (12 smooth cylindrical half-round ribs, peak-centered)
@@ -1147,7 +1148,7 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         h = 0.14 + 0.78 * pyr
         cav = _smoothstep(0.32, 0.16, h)
         ridge = _smoothstep(0.75, 0.92, h)
-        return h.astype(np.float32), 21.0, cav.astype(np.float32), 0.18, ridge.astype(np.float32)
+        return h.astype(np.float32), 14.0, cav.astype(np.float32), 0.18, ridge.astype(np.float32)
 
     if detail_id == "acoustic_kerf_felt":
         # Compressed matte heather wool-PET acoustic felt: razor-sharp knife-cut kerf slits (NO pillowed bevels!) + dense micro-fibers

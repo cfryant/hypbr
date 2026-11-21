@@ -83,17 +83,30 @@ def compute_height_blend_mask(
         return np.full_like(h_a, f, dtype=np.float32)
 
     H, W = h_a.shape
-    # Seamless organic edge breakup prevents artificial uniform blobs on regular patterns
-    breakup = gd._periodic_fbm(H, W, 9137, (6, 12, 24, 48)) * 0.14
+    res_scale = min(H, W) / 512.0
+    # Smooth macro region field + crisp micro edge breakup (prevents stray noise smudges on tied flat plateaus)
+    macro = gd._periodic_fbm(H, W, 5213, (2, 4))
+    breakup = gd._periodic_fbm(H, W, 9137, (16, 32, 64)) * 0.045
     if mode == "cavity":
-        # Low valleys of A + high relief of B + organic breakup favors B
-        score = (1.0 - h_a) * 0.55 + h_b * 0.45 + breakup + (f * 1.4 - 0.7)
+        # Strictly confine material B inside recessed local bowls/valleys of A while protecting A's raised ridges
+        h_a_loc = dp.gaussian_blur_np(h_a, max(2.0, 10.0 * res_scale), circular=True)
+        local_bowl = np.clip((h_a_loc - h_a) * 2.6 + 0.5, 0.0, 1.0)
+        ridge_prot = np.clip((h_a - h_a_loc) * 3.5, 0.0, 1.0)
+        score = (1.0 - h_a) * 0.55 + local_bowl * 0.45 - 0.45 * ridge_prot + breakup * 0.8 + (f * 1.15 - 0.575)
         m = np.clip((score - 0.5) / c + 0.5, 0.0, 1.0)
     elif mode == "height":
-        ma = h_a + (1.0 - f)
-        mb = h_b + f + breakup
-        diff = mb - ma
-        m = np.clip(diff / c + 0.5, 0.0, 1.0)
+        # Contiguous height-modulated transition: macro region sweeps cleanly while height detail
+        # carves natural mortar/edge steps along the boundary without letting isolated spikes poke
+        # disconnected islands through grout lines or flat plateaus.
+        h_a_env = 0.55 * dp.gaussian_blur_np(h_a, max(2.0, 9.0 * res_scale), circular=True) + 0.45 * h_a
+        h_b_env = 0.55 * dp.gaussian_blur_np(h_b, max(2.0, 9.0 * res_scale), circular=True) + 0.45 * h_b
+        region = (2.0 * f - 1.0) * 0.95 + macro * 0.92
+        frontier = np.exp(-5.0 * region * region)
+        diff = region + (h_b_env - h_a_env) * (0.28 * frontier) + breakup * frontier
+        m0 = np.clip(diff / max(c * 1.4, 0.06) + 0.5, 0.0, 1.0)
+        # Mild continuity filter dissolves isolated pinpoint slivers while preserving crisp boundary contours
+        m_cont = dp.gaussian_blur_np(m0, max(1.0, 3.0 * res_scale), circular=True)
+        m = np.clip((m_cont - 0.5) / 0.28 + 0.5, 0.0, 1.0)
     else:
         raise ValueError(f"Unknown blend mode {mode!r}. Choose 'height', 'cavity', or 'linear'.")
     # Smoothstep for crisp yet anti-aliased transitions
@@ -105,7 +118,7 @@ def blend_materials(
     dir_b: Path | str,
     out_dir: Path | str,
     factor: float = 0.5,
-    contrast: float = 0.09,
+    contrast: float = 0.06,
     mode: str = "height",
 ) -> Path:
     """Physically blend two hypbr material directories into a new seamless 15-map directory."""
@@ -125,32 +138,59 @@ def blend_materials(
         surf_mask = mask
         met_mask = mask
     else:
-        sm = np.clip((mask - 0.5) / 0.24 + 0.5, 0.0, 1.0)
+        sm = np.clip((mask - 0.5) / 0.22 + 0.5, 0.0, 1.0)
         surf_mask = (sm * sm * (3.0 - 2.0 * sm)).astype(np.float32)
-        mm = np.clip((mask - 0.5) / 0.16 + 0.5, 0.0, 1.0)
+        mm = np.clip((mask - 0.5) / 0.14 + 0.5, 0.0, 1.0)
         met_mask = (mm * mm * (3.0 - 2.0 * mm)).astype(np.float32)
     m3 = surf_mask[..., None]
 
-    # 1. Linear-light albedo blend + subtle contact darkening at overlay rim
+    # Contact-shadow halo along the seam boundary (gives grounded physical seating)
+    H, W = surf_mask.shape
+    res_scale = min(H, W) / 512.0
+    rim_band = 4.0 * surf_mask * (1.0 - surf_mask)
+    if mode == "linear":
+        contact_ao = np.ones_like(surf_mask)
+    else:
+        sm_blur = dp.gaussian_blur_np(surf_mask, max(1.0, 3.0 * res_scale), circular=True)
+        # Darken recessed side just outside the upper material's rim
+        if mode == "height":
+            seam_sh = np.clip(np.abs(sm_blur - surf_mask) * 2.4, 0.0, 1.0)
+        else:
+            seam_sh = np.clip((1.0 - sm_blur) * surf_mask * 2.2 + rim_band * 0.6, 0.0, 1.0)
+        contact_ao = np.clip(1.0 - 0.38 * seam_sh, 0.55, 1.0).astype(np.float32)
+
+    # 1. Linear-light albedo blend + grounded contact shading at material boundary
     alb_a = _load_srgb_linear(pa / "albedo_delit.png", size)
     alb_b = _load_srgb_linear(pb / "albedo_delit.png", size)
-    rim_band = 4.0 * surf_mask * (1.0 - surf_mask)  # peaks at 1.0 along material boundary
-    alb_lin = ((1.0 - m3) * alb_a + m3 * alb_b) * (1.0 - 0.10 * rim_band[..., None])
+    alb_lin = ((1.0 - m3) * alb_a + m3 * alb_b) * (0.72 + 0.28 * contact_ao[..., None])
     alb_u8 = np.clip(np.power(np.clip(alb_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    # 2. Height & slope-consistent normal blend with physical transition bevel
-    h_blend = (1.0 - surf_mask) * h_a + surf_mask * (h_b + (0.04 if mode == "height" else 0.0))
-    h_out = dp.normalize_height(h_blend, clip_pct=0.5)
+    # 2. Height & slope-consistent normal blend with physical step lip & soft-knee slope limit
     n_a = _load_normal_f32(pa / "normal.png", size)
     n_b = _load_normal_f32(pb / "normal.png", size)
-    n_lip = gd._height_to_normal_periodic(surf_mask, slope=0.35 if mode != "linear" else 0.0)
+    if mode == "height":
+        h_blend = np.maximum((1.0 - surf_mask) * h_a, surf_mask * (h_b + 0.14))
+        lip_slope = 2.4
+    elif mode == "cavity":
+        h_blend = (1.0 - surf_mask) * h_a + surf_mask * (h_a * 0.65 + h_b * 0.20)
+        # Attenuate inset cavity material's micro-slope so it sits recessed rather than bulging above A's ridges
+        pb_s, qb_s = ng.normal_to_slopes(n_b)
+        n_b = ng.slopes_to_normal(pb_s * 0.55, qb_s * 0.55)
+        lip_slope = -1.8
+    else:
+        h_blend = (1.0 - surf_mask) * h_a + surf_mask * h_b
+        lip_slope = 0.0
+    h_out = dp.normalize_height(h_blend, clip_pct=0.5)
+    n_lip = gd._height_to_normal_periodic(surf_mask, slope=lip_slope)
     n_mix = ng.normalize_n((1.0 - m3) * n_a + m3 * n_b)
-    n_out = ng.normalize_n(np.stack([n_mix[..., 0] + n_lip[..., 0] * 0.45, n_mix[..., 1] + n_lip[..., 1] * 0.45, np.maximum(n_mix[..., 2], 0.15)], axis=-1))
+    n_out = dp.blend_rnm(n_mix, n_lip, detail_weight=0.55)
+    n_out = ng.node_normal_clamp_slope({"circular": True}, {"normal": n_out}, max_angle_deg=60.0)["normal"]
 
     # 3. Roughness (with Specular AA) & crisp physical Metallic
     r_a = _load_gray_f32(pa / "roughness.png", size, 0.5)
     r_b = _load_gray_f32(pb / "roughness.png", size, 0.5)
-    rough = np.clip((1.0 - surf_mask) * r_a + surf_mask * r_b + 0.06 * rim_band, 0.06, 0.98).astype(np.float32)
+    cav_rough_boost = (0.14 * surf_mask) if mode == "cavity" else 0.0
+    rough = np.clip((1.0 - surf_mask) * r_a + surf_mask * r_b + cav_rough_boost + 0.12 * (1.0 - contact_ao), 0.06, 0.98).astype(np.float32)
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": n_out}, strength=0.2, max_boost=0.06)["roughness"]
 
     met_a = _load_gray_f32(pa / "metallic.png", size, 0.0)
@@ -158,8 +198,11 @@ def blend_materials(
     met = np.clip((1.0 - met_mask) * met_a + met_mask * met_b, 0.0, 1.0).astype(np.float32)
     met_u8 = np.clip(met * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    # 4. Recompute physical 8-azimuth HBAO + bent normal + curvature + anisotropy + thickness
-    hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h_out, "normal": n_out}, strength=1.45, height_scale=18.0)
+    # 4. Recompute physical 8-azimuth HBAO + contact seam AO + bent normal + curvature + anisotropy + thickness
+    hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h_out, "normal": n_out}, strength=1.10, height_scale=12.0, ao_floor=0.18)
+    ao = np.clip(hbao["ao"] * contact_ao, 0.16, 1.0).astype(np.float32)
+    hbao["ao"] = ao
+    hbao["ao_u8"] = np.clip(ao * 255.0 + 0.5, 0, 255).astype(np.uint8)
     ao = hbao["ao"]
     curv = ng.node_curvature_multiscale({"circular": True}, {"normal": n_out}, gain=2.8)
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_out, "ao": ao, "roughness": rough})

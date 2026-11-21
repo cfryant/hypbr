@@ -375,12 +375,23 @@ def node_normal_slope_gate(ctx: dict, inputs: dict, thresh: float = 0.055, bevel
 
 
 @register_node("NormalClampSlope")
-def node_normal_clamp_slope(ctx: dict, inputs: dict, max_angle_deg: float = 55.0, **_):
-    """Physical tangent-slope limiter (prevents extreme specular aliasing / grazing artifacts)."""
+def node_normal_clamp_slope(
+    ctx: dict,
+    inputs: dict,
+    max_angle_deg: float = 55.0,
+    soft_knee: bool = True,
+    **_,
+):
+    """Physical tangent-slope limiter (smooth soft-knee compression preserves bevel gradients)."""
     p, q = normal_to_slopes(inputs["normal"])
     max_s = math.tan(math.radians(min(float(max_angle_deg), 82.0)))
     mag = np.sqrt(p * p + q * q) + 1e-8
-    scale = np.minimum(1.0, max_s / mag)
+    if soft_knee:
+        r = np.minimum(mag / max_s, 100.0)
+        r2 = r * r
+        scale = np.where(mag > max_s * 100.0, max_s / mag, 1.0 / np.power(1.0 + r2 * r2, 0.25))
+    else:
+        scale = np.minimum(1.0, max_s / mag)
     return {"normal": slopes_to_normal(p * scale, q * scale)}
 
 
@@ -619,19 +630,28 @@ def node_structure_tensor_denoise(
 
 
 @register_node("NormalWeldFillet")
-def node_normal_weld_fillet(ctx: dict, inputs: dict, radius: float = 3.5, strength: float = 0.62, **_):
+def node_normal_weld_fillet(
+    ctx: dict,
+    inputs: dict,
+    radius: float = 3.5,
+    strength: float = 0.62,
+    res_invariant: bool = True,
+    **_,
+):
     """Painted/welded junction fillet operator:
     Applies bounded smooth fillet normal rounding specifically inside concave junctions
     (`weight` bounded by `max(1, weight)` so crisp outer edges remain sharp!)."""
     circ = ctx.get("circular", False)
     N = normalize_n(inputs["normal"])
     conc = inputs["concave"]
-    # Smooth neighbourhood normal weighted by radius (analogous to WeldField lookup)
-    r = max(float(radius), 1.0)
+    H, W = N.shape[:2]
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
+    # Smooth neighbourhood normal weighted by UV-calibrated radius (analogous to WeldField lookup)
+    r = max(float(radius) * res_scale, 0.75)
     N_blur = np.stack([dp.gaussian_blur_np(N[..., c], r, circular=circ) for c in range(3)], axis=-1)
     N_blur = normalize_n(N_blur)
     # Only blend where concave junction mask is active (matches alignment & radius check in WeldShading.metal)
-    w = np.clip(dp.gaussian_blur_np(conc, r * 0.6, circular=circ) * float(strength), 0.0, 0.75)[..., None]
+    w = np.clip(dp.gaussian_blur_np(conc, max(r * 0.6, 0.5), circular=circ) * float(strength), 0.0, 0.75)[..., None]
     out = normalize_n(N + (N_blur - N) * w)
     return {"normal": out}
 
@@ -761,6 +781,25 @@ def node_hardops_plug_stamp(
     return {"height": out_h, "normal": out_n, "mask": mask.astype(np.float32), "edge_mask": edge_m.astype(np.float32)}
 
 
+def _interp_grid_2d(g: np.ndarray, H: int, W: int, circular: bool) -> np.ndarray:
+    """Bilinearly upsample a 2D coarse grid to `(H, W)`; exact torus-periodic when `circular=True`."""
+    if not circular:
+        return F.interpolate(torch.from_numpy(g.astype(np.float32))[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
+    gh, gw = g.shape
+    arr = np.pad(g.astype(np.float32), ((0, 1), (0, 1)), mode="wrap")
+    u = np.arange(W, dtype=np.float32) * (gw / float(W))
+    v = np.arange(H, dtype=np.float32) * (gh / float(H))
+    ix = np.floor(u).astype(np.int32)
+    iy = np.floor(v).astype(np.int32)
+    fx = (u - ix)[None, :]
+    fy = (v - iy)[:, None]
+    v00 = arr[iy[:, None], ix[None, :]]
+    v10 = arr[iy[:, None], (ix + 1)[None, :]]
+    v01 = arr[(iy + 1)[:, None], ix[None, :]]
+    v11 = arr[(iy + 1)[:, None], (ix + 1)[None, :]]
+    return ((1.0 - fy) * ((1.0 - fx) * v00 + fx * v10) + fy * ((1.0 - fx) * v01 + fx * v11)).astype(np.float32)
+
+
 @register_node("MicroGrain")
 def node_micro_grain(
     ctx: dict,
@@ -770,36 +809,40 @@ def node_micro_grain(
     strength: float = 0.25,
     angle_deg: float = 0.0,
     seed: int = 7,
+    res_invariant: bool = True,
     **_,
 ):
     """Procedural micro-grain normal synthesis (brushed metal, cast stipple, mineral grain)."""
     base_n = inputs["normal"]
     H, W = base_n.shape[:2]
+    circ = ctx.get("circular", False)
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
     rng = np.random.default_rng(int(seed))
     if kind == "brushed":
-        # Anisotropic fine machined brush lines (lightweight float32 1D broadcast)
+        # Anisotropic fine machined brush lines (exact periodic when circular=True)
         g = rng.standard_normal((max(8, int(scale * 4)), max(4, int(scale * 0.35)))).astype(np.float32)
-        t = F.interpolate(torch.from_numpy(g)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
+        t = _interp_grid_2d(g, H, W, circular=circ)
         th = math.radians(float(angle_deg))
-        yy_1d = np.arange(H, dtype=np.float32) / float(W)
+        cycles = max(4, int(round(float(scale) * 24.0 / (2.0 * math.pi))))
+        yy_1d = np.arange(H, dtype=np.float32) / float(H)
         if abs(th) < 1e-5:
-            grain = 0.65 * t + 0.35 * np.sin(yy_1d * float(scale) * 24.0)[:, None]
+            grain = 0.65 * t + 0.35 * np.sin(yy_1d * (2.0 * math.pi * cycles))[:, None]
         else:
             xx_1d = np.arange(W, dtype=np.float32) / float(W)
             ry = math.sin(th) * xx_1d[None, :] + math.cos(th) * yy_1d[:, None]
-            grain = 0.65 * t + 0.35 * np.sin(ry * float(scale) * 24.0)
+            grain = 0.65 * t + 0.35 * np.sin(ry * (2.0 * math.pi * cycles))
     elif kind == "cast":
         # Cast-iron stipple (two-octave periodic fbm)
         g1 = rng.standard_normal((max(8, int(scale)), max(8, int(scale)))).astype(np.float32)
         g2 = rng.standard_normal((max(16, int(scale * 2.5)), max(16, int(scale * 2.5)))).astype(np.float32)
-        t1 = F.interpolate(torch.from_numpy(g1)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
-        t2 = F.interpolate(torch.from_numpy(g2)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
+        t1 = _interp_grid_2d(g1, H, W, circular=circ)
+        t2 = _interp_grid_2d(g2, H, W, circular=circ)
         grain = 0.55 * t1 + 0.45 * t2
     else:  # "mineral"
         g = rng.standard_normal((max(16, int(scale * 2)), max(16, int(scale * 2)))).astype(np.float32)
-        grain = F.interpolate(torch.from_numpy(g)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
+        grain = _interp_grid_2d(g, H, W, circular=circ)
 
-    N_g = dp.height_to_unit_normal(grain, strength=float(strength) * 2.2, circular=ctx.get("circular", False))
+    N_g = dp.height_to_unit_normal(grain, strength=float(strength) * 2.2 * res_scale, circular=circ)
     return {"normal": dp.blend_rnm(base_n, N_g, detail_weight=1.0), "grain": grain.astype(np.float32)}
 
 
@@ -815,13 +858,27 @@ def node_normal_blend_masked(ctx: dict, inputs: dict, mode: str = "rnm", weight:
 
 
 @register_node("RoughnessSpecularAA")
-def node_roughness_specular_aa(ctx: dict, inputs: dict, strength: float = 0.25, max_boost: float = 0.08, **_):
+def node_roughness_specular_aa(
+    ctx: dict,
+    inputs: dict,
+    strength: float = 0.25,
+    max_boost: float = 0.08,
+    res_invariant: bool = True,
+    **_,
+):
     """Kaplanyan / Toksvig Specular Anti-Aliasing roughness variance boost:
     `rough = sqrt(min(1, rough^2 + min(max_boost, variance * strength)))` — prevents grazing specular flicker!"""
+    circ = ctx.get("circular", False)
     N = normalize_n(inputs["normal"])
     r = inputs["roughness"].astype(np.float32)
-    dx = np.gradient(N, axis=1)
-    dy = np.gradient(N, axis=0)
+    H, W = r.shape[:2]
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
+    if circ:
+        dx = 0.5 * (np.roll(N, -1, axis=1) - np.roll(N, 1, axis=1)) * res_scale
+        dy = 0.5 * (np.roll(N, -1, axis=0) - np.roll(N, 1, axis=0)) * res_scale
+    else:
+        dx = np.gradient(N, axis=1) * res_scale
+        dy = np.gradient(N, axis=0) * res_scale
     var = np.maximum(np.sum(dx * dx, axis=-1), np.sum(dy * dy, axis=-1))
     r_aa = np.sqrt(np.minimum(1.0, r * r + np.minimum(float(max_boost), var * float(strength)))).astype(np.float32)
     return {"roughness": r_aa, "roughness_u8": np.clip(r_aa * 255.0 + 0.5, 0, 255).astype(np.uint8)}
@@ -1172,45 +1229,54 @@ def node_normal_anisotropic_brush(
     strength: float = 0.22,
     radial: bool = False,
     seed: int = 73,
+    res_invariant: bool = True,
     **_,
 ):
     """Physically consistent directional brushed/milled metal or lathe-turned tangent-space normal detail
     blended onto `normal` via exact RNM."""
+    circ = ctx.get("circular", False)
     N = inputs["normal"].astype(np.float32)
     H, W = N.shape[:2]
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
     rng = np.random.default_rng(int(seed))
 
     # Generate high-aspect-ratio periodic brushed noise field
     f_across = max(8, int(round(freq)))
     f_along = max(2, int(round(f_across / max(1.0, anisotropy))))
     g = rng.standard_normal((f_along, f_across)).astype(np.float32)
-    h_br = F.interpolate(torch.from_numpy(g)[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy()
+    h_br = _interp_grid_2d(g, H, W, circular=circ)
     h_br = (h_br - h_br.mean()) / (h_br.std() + 1e-6)
 
-    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
-    u = (xx / W) - 0.5
-    v = (yy / H) - 0.5
-
-    if radial:
-        # Concentric lathe-turned radial brushing around center
-        r = np.sqrt(u * u + v * v) * 2.0
-        th = np.arctan2(v, u) / (2.0 * math.pi) + 0.5
-        gx = (r * 2.0 - 1.0)
-        gy = (th * 2.0 - 1.0)
-        grid = torch.from_numpy(np.stack([gx, gy], axis=-1)[None]).float()
-        h_rot = F.grid_sample(torch.from_numpy(h_br)[None, None], grid, mode="bilinear", padding_mode="reflection", align_corners=True)[0, 0].numpy()
+    if not radial and abs(float(angle_deg)) < 1e-4:
+        h_rot = h_br
     else:
-        rad = math.radians(float(angle_deg))
-        ca, sa = math.cos(rad), math.sin(rad)
-        ru = (ca * u - sa * v) + 0.5
-        rv = (sa * u + ca * v) + 0.5
-        ru = (ru % 1.0) * 2.0 - 1.0
-        rv = (rv % 1.0) * 2.0 - 1.0
-        grid = torch.from_numpy(np.stack([ru, rv], axis=-1)[None]).float()
-        h_rot = F.grid_sample(torch.from_numpy(h_br)[None, None], grid, mode="bilinear", padding_mode="reflection", align_corners=True)[0, 0].numpy()
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        u = (xx / W) - 0.5
+        v = (yy / H) - 0.5
+        if radial:
+            # Concentric lathe-turned radial brushing around center
+            r = np.sqrt(u * u + v * v) * 2.0
+            th = np.arctan2(v, u) / (2.0 * math.pi) + 0.5
+            gx = (r * 2.0 - 1.0)
+            gy = (th * 2.0 - 1.0)
+            grid = torch.from_numpy(np.stack([gx, gy], axis=-1)[None]).float()
+            h_rot = F.grid_sample(torch.from_numpy(h_br)[None, None], grid, mode="bilinear", padding_mode="reflection", align_corners=True)[0, 0].numpy()
+        else:
+            rad = math.radians(float(angle_deg))
+            ca, sa = math.cos(rad), math.sin(rad)
+            ru = (ca * u - sa * v) + 0.5
+            rv = (sa * u + ca * v) + 0.5
+            ru = (ru % 1.0) * 2.0 - 1.0
+            rv = (rv % 1.0) * 2.0 - 1.0
+            grid = torch.from_numpy(np.stack([ru, rv], axis=-1)[None]).float()
+            h_rot = F.grid_sample(torch.from_numpy(h_br)[None, None], grid, mode="bilinear", padding_mode="reflection", align_corners=True)[0, 0].numpy()
 
-    dx = np.gradient(h_rot, axis=1)
-    dy = np.gradient(h_rot, axis=0)
+    if circ:
+        dx = 0.5 * (np.roll(h_rot, -1, axis=1) - np.roll(h_rot, 1, axis=1)) * res_scale
+        dy = 0.5 * (np.roll(h_rot, -1, axis=0) - np.roll(h_rot, 1, axis=0)) * res_scale
+    else:
+        dx = np.gradient(h_rot, axis=1) * res_scale
+        dy = np.gradient(h_rot, axis=0) * res_scale
     N_br = slopes_to_normal(-dx * float(strength) * 1.8, +dy * float(strength) * 1.8)
     return {"normal": dp.blend_rnm(N, N_br, detail_weight=1.0), "brush_h": h_rot.astype(np.float32)}
 
@@ -1476,26 +1542,31 @@ def node_curvature_multiscale(
     sigmas: tuple[float, ...] = (0.8, 2.0, 5.0),
     weights: tuple[float, ...] = (0.45, 0.35, 0.20),
     gain: float = 3.2,
+    res_invariant: bool = True,
     **_,
 ):
     """V13 Multi-Scale Signed Mean Curvature (Substance/Marmoset 0.5-neutral standard) + fine Cavity & Convex/Concave."""
     circ = ctx.get("circular", False)
     N = inputs["normal"].astype(np.float32)
     p, q = normal_to_slopes(N)
+    H, W = p.shape
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
 
     div_acc = np.zeros_like(p)
     fine_conc = None
     for idx, (sig, w) in enumerate(zip(sigmas, weights)):
-        ps = dp.gaussian_blur_np(p, float(sig), circular=circ) if sig > 0.3 else p
-        qs = dp.gaussian_blur_np(q, float(sig), circular=circ) if sig > 0.3 else q
+        sig_eff = float(sig) * res_scale
+        ps = dp.gaussian_blur_np(p, sig_eff, circular=circ) if sig_eff > 0.3 else p
+        qs = dp.gaussian_blur_np(q, sig_eff, circular=circ) if sig_eff > 0.3 else q
         if circ:
             dpdx = 0.5 * (np.roll(ps, -1, axis=1) - np.roll(ps, 1, axis=1))
             dqdy = 0.5 * (np.roll(qs, -1, axis=0) - np.roll(qs, 1, axis=0))
         else:
             dpdx = np.gradient(ps, axis=1)
             dqdy = np.gradient(qs, axis=0)
-        # Positive divergence = convex ridge, negative = concave valley
-        curv_s = -(dpdx - dqdy) * 0.5
+        # OpenGL slopes: p = -dh/dx, q = +dh/dy => -lap_h = d(p)/dx - d(q)/dy
+        # Positive = convex ridge/crest, negative = concave valley/grout (UV-calibrated via res_scale)
+        curv_s = (dpdx - dqdy) * (0.5 * res_scale)
         div_acc += float(w) * curv_s
         if idx == 0:
             fine_conc = np.maximum(0.0, -curv_s)
@@ -1525,8 +1596,9 @@ def node_curvature_multiscale(
 def node_anisotropy_flow(
     ctx: dict,
     inputs: dict,
-    sigma_tensor: float = 3.0,
+    sigma_tensor: float = 2.0,
     base_f0: float = 0.50,
+    res_invariant: bool = True,
     **_,
 ):
     """V13 glTF `KHR_materials_anisotropy` Structure-Tensor Flow Map (R=cos(theta), G=sin(theta), B=coherence)
@@ -1535,21 +1607,47 @@ def node_anisotropy_flow(
     h = inputs["height"].astype(np.float32)
     ao = np.clip(inputs["ao"].astype(np.float32), 0.0, 1.0)
     rough = np.clip(inputs["roughness"].astype(np.float32), 0.0, 1.0)
+    H, W = h.shape
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
 
-    gx = np.gradient(h, axis=1)
-    gy = np.gradient(h, axis=0)
-    Jxx = dp.gaussian_blur_np(gx * gx, float(sigma_tensor), circular=circ)
-    Jyy = dp.gaussian_blur_np(gy * gy, float(sigma_tensor), circular=circ)
-    Jxy = dp.gaussian_blur_np(gx * gy, float(sigma_tensor), circular=circ)
+    if circ:
+        gx = 0.5 * (np.roll(h, -1, axis=1) - np.roll(h, 1, axis=1)) * res_scale
+        gy = 0.5 * (np.roll(h, -1, axis=0) - np.roll(h, 1, axis=0)) * res_scale
+    else:
+        gx = np.gradient(h, axis=1) * res_scale
+        gy = np.gradient(h, axis=0) * res_scale
+    sig_eff = max(0.5, float(sigma_tensor) * res_scale)
+    Jxx = dp.gaussian_blur_np(gx * gx, sig_eff, circular=circ)
+    Jyy = dp.gaussian_blur_np(gy * gy, sig_eff, circular=circ)
+    Jxy = dp.gaussian_blur_np(gx * gy, sig_eff, circular=circ)
 
-    # Tangent flow direction is perpendicular to gradient (minor eigenvector of J)
-    theta = 0.5 * np.arctan2(2.0 * Jxy, Jxx - Jyy) + math.pi * 0.5
-    tr = Jxx + Jyy + 1e-8
+    # Tangent flow direction is perpendicular to gradient (minor eigenvector of J).
+    # Gate coherence by local unblurred + tight-blurred gradient energy so flat decks/panels
+    # cleanly decay to isotropic neutral (B=0, tangent=(+1,0)) without halos or noise blobs.
+    tr = Jxx + Jyy
+    raw_e = dp.gaussian_blur_np(gx * gx + gy * gy, max(0.4, 0.9 * res_scale), circular=circ)
+    eps_energy = max(4e-4, 0.22 * float(np.percentile(tr, 95)))
+    ew = raw_e / (raw_e + eps_energy)
+    energy_w = (ew * ew).astype(np.float32)
     diff = np.sqrt((Jxx - Jyy) ** 2 + 4.0 * Jxy * Jxy)
-    coherence = np.clip(diff / tr, 0.0, 1.0).astype(np.float32)
+    coherence = np.clip((diff / (tr + 1e-8)) * energy_w, 0.0, 1.0).astype(np.float32)
 
-    aniso_r = np.clip((np.cos(theta) * 0.5 + 0.5) * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    aniso_g = np.clip((np.sin(theta) * 0.5 + 0.5) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    theta = 0.5 * np.arctan2(2.0 * Jxy, Jxx - Jyy) + math.pi * 0.5
+    vx = np.cos(theta)
+    vy = np.sin(theta)
+    # Canonicalize 180-deg symmetric tangent into unified +X half-plane across all materials
+    flip = (vx < -1e-4) | ((np.abs(vx) <= 1e-4) & (vy < 0.0))
+    vx = np.where(flip, -vx, vx)
+    vy = np.where(flip, -vy, vy)
+    # Smoothly fade low-coherence flat/isotropic zones to canonical glTF neutral tangent (+1, 0)
+    tx = coherence * vx + (1.0 - coherence) * 1.0
+    ty = coherence * vy
+    tn = np.sqrt(tx * tx + ty * ty) + 1e-8
+    tx = tx / tn
+    ty = ty / tn
+
+    aniso_r = np.clip((tx * 0.5 + 0.5) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    aniso_g = np.clip((ty * 0.5 + 0.5) * 255.0 + 0.5, 0, 255).astype(np.uint8)
     aniso_b = np.clip(coherence * 255.0 + 0.5, 0, 255).astype(np.uint8)
     aniso_u8 = np.stack([aniso_r, aniso_g, aniso_b], axis=-1)
 
@@ -1568,18 +1666,22 @@ def node_thickness_subsurface(
     ctx: dict,
     inputs: dict,
     radii: tuple[float, ...] = (2.0, 6.0, 16.0),
+    res_invariant: bool = True,
     **_,
 ):
     """V13 Local Thin-Feature Translucency / Subsurface Thickness Map (bright on thin protruding
     carved edges/lips, dark in thick deep recesses — ready for glTF `KHR_materials_volume` / SSS)."""
     circ = ctx.get("circular", False)
     h = dp.normalize_height(inputs["height"].astype(np.float32), clip_pct=0.5)
+    H, W = h.shape
+    res_scale = (min(H, W) / 512.0) if res_invariant else 1.0
     acc = np.zeros_like(h)
     for r in radii:
-        hl = dp.gaussian_blur_np(h, float(r), circular=circ)
+        r_eff = max(0.5, float(r) * res_scale)
+        hl = dp.gaussian_blur_np(h, r_eff, circular=circ)
         # Protruding thin features have h > local average
         acc += np.clip((h - hl) * 2.4 + 0.5, 0.0, 1.0)
-    thin = np.clip(acc / float(len(radii)) * 0.70 + h * 0.30, 0.0, 1.0).astype(np.float32)
+    thin = np.clip(0.14 + 0.82 * (acc / float(len(radii)) * 0.68 + h * 0.32), 0.12, 0.98).astype(np.float32)
     return {
         "thickness": thin,
         "thickness_u8": np.clip(thin * 255.0 + 0.5, 0, 255).astype(np.uint8),
@@ -1689,7 +1791,7 @@ def get_preset_graph(name: str = "v13-default") -> dict:
                  "inputs": {"ao": "ao.ao", "roughness": "rough.roughness", "metallic": "metal.metallic"}},
                 {"id": "aniso", "type": "AnisotropyFlow",
                  "inputs": {"height": "poisson_h.height", "ao": "ao.ao", "roughness": "rough.roughness"},
-                 "params": {"sigma_tensor": 3.0, "base_f0": 0.50}},
+                 "params": {"sigma_tensor": 2.0, "base_f0": 0.50}},
                 {"id": "thick", "type": "ThicknessSubsurface",
                  "inputs": {"height": "poisson_h.height"},
                  "params": {}},

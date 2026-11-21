@@ -333,7 +333,7 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
         pit_c = np.array([0.032, 0.034, 0.040], np.float32)[None, None, :]
         crown_c = np.array([0.17, 0.18, 0.20], np.float32)[None, None, :]
         alb = pit_c * (1.0 - ridge[..., None]) + crown_c * ridge[..., None]
-        met = np.clip(0.82 * (1.0 - 0.55 * cav), 0.18, 0.88).astype(np.float32)
+        met = np.clip(0.88 * (1.0 - 0.38 * cav), 0.30, 0.92).astype(np.float32)
         r_mod = -0.10 * ridge + 0.36 * cav
 
     elif did == "tufted_emerald_velvet":
@@ -374,9 +374,10 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
         # Authentic warm burnished gold-leaf / antique brass pressed tin with dark umber-soot recess patina
         gold = np.array([0.92, 0.72, 0.34], np.float32)[None, None, :] * (0.95 + 0.05 * m1[..., None])
         patina = np.array([0.18, 0.12, 0.06], np.float32)[None, None, :]
-        alb = gold * (1.0 - 0.82 * cav[..., None]) + patina * (0.82 * cav[..., None])
-        met = np.clip(0.97 * (1.0 - 0.78 * cav), 0.18, 0.99).astype(np.float32)
-        r_mod = -0.06 * ridge + 0.52 * cav
+        pat_m = gd._smoothstep(0.25, 0.78, cav)
+        alb = gold * (1.0 - 0.82 * pat_m[..., None]) + patina * (0.82 * pat_m[..., None])
+        met = np.clip(0.97 * (1.0 - 0.86 * pat_m), 0.08, 0.99).astype(np.float32)
+        r_mod = -0.06 * ridge + 0.52 * pat_m
 
     elif did in (
         "chainlink_wire_mesh", "expanded_metal_mesh", "street_storm_grate",
@@ -386,11 +387,12 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
         # Open-void perforated/mesh metals: gleaming clean metal frame + DEEP dark open void interiors!
         void_c = np.array([0.016, 0.017, 0.020], np.float32)[None, None, :]
         crest = np.clip(base * 1.24 + 0.05, 0.0, 0.94)
+        void_m = gd._smoothstep(0.22, 0.72, cav)
         alb = base * (0.96 + 0.035 * m1[..., None] + 0.025 * m2[..., None])
         alb = alb * (1.0 - 0.30 * ridge[..., None]) + crest * (0.30 * ridge[..., None])
-        alb = alb * (1.0 - 0.96 * cav[..., None]) + void_c * (0.96 * cav[..., None])
-        met = np.clip(0.95 * (1.0 - 0.96 * cav), 0.0, 0.98).astype(np.float32)
-        r_mod = -0.07 * ridge + 0.65 * cav
+        alb = alb * (1.0 - 0.96 * void_m[..., None]) + void_c * (0.96 * void_m[..., None])
+        met = np.clip(0.96 * (1.0 - void_m), 0.0, 0.98).astype(np.float32)
+        r_mod = -0.07 * ridge + 0.65 * void_m
 
     elif did in ("acoustic_pegboard", "perforated_leather_auto"):
         # Perforated wood / pebble leather: clean surface + deep dark punched through-holes!
@@ -402,14 +404,19 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
         r_mod = 0.50 * hole_m - 0.05 * ridge
 
     elif mat_kind == "metal":
-        # Clean machined/cast metal: oil-darkened recesses + bright specular-polished chamfered crests (zero cloudy blotch!)
-        oil = np.array([0.10, 0.10, 0.12], np.float32)[None, None, :]
-        crest = np.clip(base * 1.22 + 0.05, 0.0, 0.94)
+        # Clean machined/cast metal: bare metallic across both decks and grooves; warm bronze-umber recesses for gold/brass!
+        is_warm_metal = float(base[0, 0, 0]) > float(base[0, 0, 2]) * 1.35
+        oil = (np.array([0.16, 0.095, 0.032], np.float32)[None, None, :]) if is_warm_metal else np.array([0.10, 0.10, 0.12], np.float32)[None, None, :]
+        crest = np.clip(base * (1.18 if is_warm_metal else 1.24) + (0.02 if is_warm_metal else 0.04), 0.0, 0.96)
+        # Tight crevice curve (1-ao)^1.8 prevents wide HBAO penumbras from painting halos on flat decks
+        occ_tight = np.power(np.clip(1.0 - ao, 0.0, 1.0), 1.8)
+        oil_m = np.clip(occ_tight * 2.2, 0.0, 1.0) * (0.35 + 0.65 * cav)
+        oil_str = 0.58 if is_warm_metal else 0.48
         alb = base * (0.96 + 0.035 * m1[..., None] + 0.025 * m2[..., None])
-        alb = alb * (1.0 - 0.52 * cav[..., None]) + oil * (0.52 * cav[..., None])
-        alb = alb * (1.0 - 0.30 * ridge[..., None]) + crest * (0.30 * ridge[..., None])
-        met = np.clip(0.95 * (1.0 - 0.42 * cav), 0.28, 0.99).astype(np.float32)
-        r_mod = -0.08 * ridge + 0.24 * cav
+        alb = alb * (1.0 - oil_str * oil_m[..., None]) + oil * (oil_str * oil_m[..., None])
+        alb = alb * (1.0 - 0.32 * ridge[..., None]) + crest * (0.32 * ridge[..., None])
+        met = np.clip(0.96 - 0.10 * oil_m, 0.84, 0.99).astype(np.float32)
+        r_mod = -0.07 * ridge + (0.14 if is_warm_metal else 0.16) * oil_m
 
     else:
         # Clean tactile dielectric fallback (rubber / leather / fabric / concrete / ceramic) without dirty Perlin clouds
@@ -444,10 +451,12 @@ def synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path:
     s1 = ng.node_hardops_plug_stamp(ctx, {"height": h0, "normal": N0}, plug="panel_seams", array_x=2, array_y=2, bevel_radius=0.04, bevel_profile="chamfer", depth=0.55, normal_strength=2.0)
     s2 = ng.node_hardops_plug_stamp(ctx, {"height": s1["height"], "normal": s1["normal"]}, plug="bolt_plate", array_x=2, array_y=2, scale=0.74, bevel_radius=0.042, bevel_profile="round", depth=0.48, normal_strength=1.9)
     s3 = ng.node_hardops_plug_stamp(ctx, {"height": s2["height"], "normal": s2["normal"]}, plug="lug_boss", array_x=2, array_y=2, scale=0.42, bevel_radius=0.048, bevel_profile="round", depth=0.55, normal_strength=2.1)
+    # Derive curvature/cavity/edge_wear from clean machined geometry BEFORE brush micro-grain
+    n_geom = ng.node_normal_clamp_slope(ctx, {"normal": s3["normal"]}, max_angle_deg=60.0)["normal"]
+    curv = ng.node_curvature_multiscale(ctx, {"normal": n_geom}, gain=3.2)
     n_br = ng.node_normal_anisotropic_brush(ctx, {"normal": s3["normal"]}, angle_deg=0.0, freq=72.0, anisotropy=14.0, strength=0.18, seed=902)["normal"]
-    curv = ng.node_curvature_multiscale(ctx, {"normal": n_br}, gain=3.4)
     n_weld = ng.node_normal_weld_fillet(ctx, {"normal": n_br, "concave": curv["concave"]}, radius=2.6, strength=0.50)["normal"]
-    n_fin = ng.node_normal_clamp_slope(ctx, {"normal": n_weld}, max_angle_deg=58.0)["normal"]
+    n_fin = ng.node_normal_clamp_slope(ctx, {"normal": n_weld}, max_angle_deg=60.0)["normal"]
 
     h_n = dp.normalize_height(s3["height"], clip_pct=0.5)
     hbao = ng.node_horizon_bent_normal_ao(ctx, {"height": h_n, "normal": n_fin}, strength=1.22, height_scale=13.0)
@@ -466,7 +475,8 @@ def synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path:
 
     rough = np.clip(0.28 + 0.34 * (1.0 - ao) - 0.12 * curv["convex"] + 0.04 * m1, 0.10, 0.90).astype(np.float32)
     rough = ng.node_roughness_specular_aa(ctx, {"roughness": rough, "normal": n_fin}, strength=0.25, max_boost=0.08)["roughness"]
-    metal = np.clip(0.92 * (0.55 + 0.45 * ao) + 0.08 * curv["convex"], 0.25, 1.0).astype(np.float32)
+    deep_oil = gd._smoothstep(0.45, 0.85, 1.0 - ao)
+    metal = np.clip(0.94 * (1.0 - 0.18 * deep_oil) + 0.05 * curv["convex"], 0.75, 0.99).astype(np.float32)
     aniso = ng.node_anisotropy_flow(ctx, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface(ctx, {"height": h_n})
     prev_u8 = render_studio_preview(alb_lin, n_fin, rough, metal, ao)
@@ -673,13 +683,14 @@ def synthesize_material(
 
     h0, slope_scale, cav0, base_r, ridge0 = gd.build_daily_detail(material_id, H, W, seed=s_base)
     h_n = dp.normalize_height(h0, clip_pct=0.5)
-    N = gd._height_to_normal_periodic(h0, slope=slope_scale)
+    N_geom = gd._height_to_normal_periodic(h0, slope=slope_scale)
+    N_geom = ng.node_normal_clamp_slope({"circular": True}, {"normal": N_geom}, max_angle_deg=60.0)["normal"]
     g_kind = "mineral" if mat_kind in ("concrete", "ceramic") else ("brushed" if mat_kind in ("metal", "carbon") else "cast")
     # Keep micro-grain subtle on flat polished slabs (marble/terrazzo/Damascus/glass)
     g_scale_fac = float(np.clip(slope_scale / 10.0, 0.25, 1.0))
     g_str = (0.032 if mat_kind in ("ceramic", "carbon") else 0.055) * g_scale_fac
-    N = ng.node_micro_grain({"circular": True}, {"normal": N}, kind=g_kind, scale=36.0, strength=g_str + 0.045 * w_amt, seed=s_base + 1000)["normal"]
-    N = ng.node_normal_clamp_slope({"circular": True}, {"normal": N}, max_angle_deg=58.0)["normal"]
+    N = ng.node_micro_grain({"circular": True}, {"normal": N_geom}, kind=g_kind, scale=36.0, strength=g_str + 0.035 * w_amt, seed=s_base + 1000)["normal"]
+    N = ng.node_normal_clamp_slope({"circular": True}, {"normal": N}, max_angle_deg=60.0)["normal"]
 
     # Relief-calibrated HBAO: flat slabs keep ao_mean ~0.92-0.97, deep reliefs keep crisp crevices (~0.62-0.80)
     ao_hs = float(np.clip(slope_scale * 0.68, 1.0, 14.0))
@@ -689,49 +700,86 @@ def synthesize_material(
         strength=ao_str, height_scale=ao_hs, ao_floor=0.18,
     )
     ao = hbao["ao"]
-    curv = ng.node_curvature_multiscale({"circular": True}, {"normal": N}, gain=2.8)
+    curv = ng.node_curvature_multiscale({"circular": True}, {"normal": N_geom}, gain=2.8)
     alb_u8, alb_lin, met_u8, r_mod = _rich_albedo_and_metal(material_id, mat_kind, tint, h_n, cav0, ridge0, ao, seed=s_base + 2000)
 
     r_micro = 0.025 * gd._periodic_fbm(H, W, s_base + 3000, (8, 24, 48))
-    rough = np.clip(base_r + r_mod + 0.16 * (1.0 - ao) + r_micro, 0.06, 0.94).astype(np.float32)
+    ao_r_w = 0.08 if mat_kind == "metal" else 0.14
+    rough = np.clip(base_r + r_mod + ao_r_w * np.power(np.clip(1.0 - ao, 0.0, 1.0), 1.4) + r_micro, 0.06, 0.94).astype(np.float32)
     met_f = met_u8.astype(np.float32) / 255.0
 
     if w_amt > 1e-4:
         w_macro = np.clip(0.5 + 0.42 * gd._periodic_fbm(H, W, s_base + 7777, (4, 8, 16)), 0.0, 1.0)
-        w_fine = np.clip(0.5 + 0.45 * gd._periodic_fbm(H, W, s_base + 8888, (16, 32, 64)), 0.0, 1.0)
-        valley = np.clip(0.55 * (1.0 - ao) + 0.45 * np.clip(1.0 - h_n, 0.0, 1.0), 0.0, 1.0)
-        # Thresholded organic tarnish/patina mask with fine-grain edge breakup (no airbrushed halos)
-        raw_patina = valley * 0.80 + w_macro * 0.48 + w_fine * 0.42 - (1.02 - 0.74 * w_amt)
-        patina = np.clip(raw_patina * (2.2 + 1.5 * w_amt), 0.0, 0.94)
-        patina = (patina * patina * (3.0 - 2.0 * patina)).astype(np.float32)
+        w_fine = np.clip(0.5 + 0.46 * gd._periodic_fbm(H, W, s_base + 8888, (16, 32, 64)), 0.0, 1.0)
+        w_micro = np.clip(0.5 + 0.48 * gd._periodic_fbm(H, W, s_base + 9999, (32, 64, 128)), 0.0, 1.0)
 
-        edge_scuff = np.clip(curv["convex"] * (0.5 + 0.9 * w_fine) * w_amt * 1.4, 0.0, 0.90)
+        # Geometry-anchored crevice/basin mask: settles in grout, dimples, and occluded lug bases
+        # while keeping flat unoccluded faces & raised crests free of blurry airbrushed clouds.
+        crevice = np.clip(
+            0.42 * (1.0 - ao) + 0.34 * (1.0 - curv["cavity"]) + 0.24 * curv["concave"],
+            0.0, 1.0,
+        )
+        # Subtle outward creep onto recessed/mid zones only at higher wear intensities
+        basin = np.clip(1.0 - h_n, 0.0, 1.0)
+        spread = (0.14 * (w_amt ** 1.35) * w_macro + 0.28 * w_amt * basin) * (1.0 - 0.75 * curv["convex"])
+        drive = crevice * (0.95 + 0.40 * w_macro) + spread + 0.26 * w_micro - 0.32 * curv["convex"]
+        thresh = 0.62 - 0.38 * w_amt
+        patina = (gd._smoothstep(thresh - 0.055, thresh + 0.075, drive) * np.clip(0.75 + 0.25 * w_amt, 0.0, 1.0)).astype(np.float32)
+
+        # Raised convex crests get burnished metal polish (metals) or micro-scuffing (dielectrics)
+        edge_scuff = np.clip(curv["convex"] * (0.45 + 0.85 * w_fine) * w_amt * 1.35, 0.0, 0.88)
+
+        # 3D granular corrosion/grime normal pitting blended via RNM inside crusted pockets
+        pit_h = (0.55 * w_micro + 0.45 * w_fine).astype(np.float32)
+        N_pit = gd._height_to_normal_periodic(pit_h, slope=2.4 * w_amt)
+        p_pit, q_pit = ng.normal_to_slopes(N_pit)
+        N_pit_m = ng.slopes_to_normal(p_pit * patina, q_pit * patina)
+        N = dp.blend_rnm(N, N_pit_m, detail_weight=1.0)
+        N = ng.node_normal_clamp_slope({"circular": True}, {"normal": N}, max_angle_deg=60.0)["normal"]
 
         is_cu = any(k in material_id for k in ("copper", "bronze", "brass")) or mat_kind in ("copper", "bronze", "brass")
         is_metal = (mat_kind in ("metal", "copper", "bronze", "brass", "gold", "steel", "iron")) or (float(met_f.mean()) > 0.35)
         if is_metal:
-            # Deep oxide tarnish + authentic muted verdigris patina (Cu/Br) or dark rust-umber (Fe/steel)
-            oxide_dark = np.array([0.072, 0.052, 0.040], dtype=np.float32)[None, None, :]
-            patina_accent = np.array([0.095, 0.285, 0.235] if is_cu else [0.21, 0.082, 0.036], dtype=np.float32)[None, None, :]
-            # At medium wear (0.45): mostly dark oxide tarnish with subtle verdigris pockets;
-            # at heavy wear (0.90): rich blue-green verdigris crust settling across valleys
-            accent_w = np.clip((w_macro * 0.55 + valley * 0.45 - (0.58 - 0.36 * w_amt)) * 2.6, 0.0, 1.0)[..., None] * (w_amt ** 0.75)
-            tarnish_col = oxide_dark * (1.0 - accent_w) + patina_accent * accent_w
-            alb_lin = alb_lin * (1.0 - patina[..., None] * 0.90) + tarnish_col * (patina[..., None] * 0.90)
+            if is_cu:
+                # Crevice-settled cuprite oxide rim + powdery blue-green verdigris core; crests stay gleaming copper
+                cuprite = np.array([0.085, 0.048, 0.032], dtype=np.float32)[None, None, :]
+                verd_lo = np.array([0.090, 0.275, 0.225], dtype=np.float32)[None, None, :]
+                verd_hi = np.array([0.195, 0.420, 0.340], dtype=np.float32)[None, None, :]
+                verd = verd_lo * (1.0 - w_micro[..., None]) + verd_hi * w_micro[..., None]
+                core_w = gd._smoothstep(0.32, 0.78, patina * (0.65 + 0.55 * crevice) * (0.55 + 0.45 * w_amt))[..., None]
+                tarnish_col = cuprite * (1.0 - core_w) + verd * core_w
+            else:
+                # 3-stage granular iron/steel rust: dark magnetite oxide + burnt sienna + dusty ochre micro-flecks
+                ox_dark = np.array([0.068, 0.042, 0.028], dtype=np.float32)[None, None, :]
+                sienna = np.array([0.235, 0.082, 0.028], dtype=np.float32)[None, None, :]
+                ochre = np.array([0.390, 0.175, 0.050], dtype=np.float32)[None, None, :]
+                rust_t = np.clip(0.25 + 0.60 * w_fine + 0.35 * (w_micro - 0.5), 0.0, 1.0)[..., None]
+                rust_warm = sienna * (1.0 - rust_t) + ochre * rust_t
+                core_w = gd._smoothstep(0.22, 0.72, patina * (0.55 + 0.55 * w_micro))[..., None]
+                tarnish_col = ox_dark * (1.0 - core_w) + rust_warm * core_w
+
+            alb_lin = alb_lin * (1.0 - patina[..., None] * 0.92) + tarnish_col * (patina[..., None] * 0.92)
             # Subtle warm polish on worn high crests
-            crest_col = np.clip(alb_lin * 1.22 + 0.04, 0.0, 0.94)
-            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.32) + crest_col * (edge_scuff[..., None] * 0.32)
-            # Crisp metallic stripping on oxidized crust (dielectric patina/oxide)
-            ox_cut = np.clip((patina - 0.28) / 0.18, 0.0, 1.0)
-            ox_cut = ox_cut * ox_cut * (3.0 - 2.0 * ox_cut)
-            met_f = np.clip(met_f * (1.0 - ox_cut * 0.96), 0.0, 1.0).astype(np.float32)
-            rough = np.clip(rough * (1.0 - patina) + np.clip(0.78 + 0.14 * w_fine, 0.68, 0.95) * patina - 0.12 * edge_scuff * met_f, 0.08, 0.97).astype(np.float32)
+            crest_col = np.clip(alb_lin * 1.18 + 0.03, 0.0, 0.94)
+            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.30) + crest_col * (edge_scuff[..., None] * 0.30)
+            # Crisp metallic stripping on oxidized crust (dielectric patina/rust)
+            ox_cut = gd._smoothstep(0.22, 0.48, patina)
+            met_f = np.clip(met_f * (1.0 - ox_cut * 0.97), 0.0, 1.0).astype(np.float32)
+            rough = np.clip(
+                rough * (1.0 - patina) + np.clip(0.80 + 0.15 * w_micro, 0.74, 0.96) * patina - 0.12 * edge_scuff * met_f,
+                0.08, 0.97,
+            ).astype(np.float32)
         else:
-            grime_col = np.array([0.065, 0.060, 0.052], dtype=np.float32)[None, None, :]
-            scuff_col = np.clip(alb_lin * 1.28 + 0.08, 0.0, 0.90)
-            alb_lin = alb_lin * (1.0 - patina[..., None] * 0.72) + grime_col * (patina[..., None] * 0.72)
-            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.42) + scuff_col * (edge_scuff[..., None] * 0.42)
-            rough = np.clip(rough + 0.32 * patina + 0.16 * edge_scuff + 0.06 * w_amt * w_fine, 0.08, 0.97).astype(np.float32)
+            # Dielectric crevice grime / mineral buildup (tightly anchored to grout/bevels, zero flat smoke clouds)
+            grime_lo = np.array([0.055, 0.050, 0.044], dtype=np.float32)[None, None, :]
+            grime_hi = np.array([0.145, 0.132, 0.112], dtype=np.float32)[None, None, :]
+            grime_col = grime_lo * (1.0 - w_micro[..., None]) + grime_hi * w_micro[..., None]
+            # Anchor dielectric grime strictly to crevices/cavities + subtle fine bevel wear
+            diel_pat = (patina * gd._smoothstep(0.08, 0.35, crevice + 0.25 * w_amt * basin)).astype(np.float32)
+            scuff_col = np.clip(alb_lin * 1.18 + 0.05, 0.0, 0.855)
+            alb_lin = alb_lin * (1.0 - diel_pat[..., None] * 0.78) + grime_col * (diel_pat[..., None] * 0.78)
+            alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.32) + scuff_col * (edge_scuff[..., None] * 0.32)
+            rough = np.clip(rough + 0.34 * diel_pat + 0.16 * edge_scuff + 0.04 * w_amt * w_micro, 0.08, 0.97).astype(np.float32)
 
         alb_u8 = np.clip(np.power(np.clip(alb_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
         met_u8 = np.clip(met_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
