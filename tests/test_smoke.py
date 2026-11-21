@@ -21,6 +21,7 @@ EXPECTED_MAPS = {
     "preview.png",
     "roughness.png",
     "specular.png",
+    "opacity.png",
     "thickness.png",
 }
 
@@ -95,3 +96,17 @@ def test_gpu_cpu_parity_periodic_fbm_and_preview() -> None:
 
     assert np.allclose(g_fbm, c_fbm, atol=1e-3)
     assert int(np.max(np.abs(g_prev.astype(int) - c_prev.astype(int)))) <= 1
+
+
+def test_opacity_cutout_chainlink_and_export(tmp_path: Path) -> None:
+    import json
+    from hypbr import export_material
+    mat = synthesize_material("chainlink_fence_galvanized", tmp_path / "fence", size=256)
+    op = Image.open(mat / "opacity.png")
+    assert op.mode == "L"
+    assert op.getextrema()[0] < 10 and op.getextrema()[1] > 245
+    exp = export_material(mat, tmp_path / "fence_gltf", target="gltf")
+    doc = json.loads((exp / "material.gltf").read_text())
+    assert doc["materials"][0]["alphaMode"] == "MASK"
+    assert doc["materials"][0]["doubleSided"] is True
+    assert Image.open(exp / "baseColor.png").mode == "RGBA"

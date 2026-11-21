@@ -28,6 +28,7 @@ SPECIAL_MIXED_METALS = {
     "pcb_solder_mask_traces",
     "damascus_folded_steel",
     "hammered_copper_dimple",
+    "chainlink_fence_galvanized",
 }
 
 

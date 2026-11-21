@@ -146,6 +146,23 @@ def verify_material(mat_dir: Path | str, seam_ratio_limit: float = 2.2) -> dict[
     if p99 > 248.0:
         warnings.append(f"Near-clipping albedo highlights (p99={p99:.1f} sRGB)")
 
+    # 5. Optional 16th map: opacity.png (cutout/alpha mask)
+    op_path = d / "opacity.png"
+    if op_path.exists():
+        with Image.open(op_path) as op_im:
+            if op_im.size != resolution:
+                errors.append(f"opacity.png resolution {op_im.size} != {resolution}")
+            op_arr = np.asarray(op_im.convert("L"), dtype=np.uint8)
+        seam_op = _seam_metrics(op_arr)
+        checks["seamless"]["opacity"] = seam_op
+        if seam_op["border_l1"] > 0.03 and seam_op["seam_ratio"] > seam_ratio_limit:
+            errors.append(f"opacity wrap seam detected (ratio={seam_op['seam_ratio']}, border_l1={seam_op['border_l1']})")
+        checks["opacity"] = {
+            "has_cutout": bool(int(op_arr.min()) < 250),
+            "opacity_min": round(float(op_arr.min() / 255.0), 3),
+            "opacity_mean": round(float(op_arr.mean() / 255.0), 3),
+        }
+
     return {
         "material": d.name,
         "passed": len(errors) == 0,

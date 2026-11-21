@@ -47,6 +47,7 @@ VIEWER_HTML = """<!doctype html>
       <option value="orm.png">glTF ORM</option>
       <option value="height.png">Height</option>
       <option value="curvature.png">Curvature</option>
+      <option value="opacity.png">Opacity (Cutout)</option>
     </select>
   </div>
   <div class="row">
@@ -128,6 +129,27 @@ const pbrMat = new THREE.MeshPhysicalMaterial({{
   metalness: 1.0,
 }});
 const flatMat = new THREE.MeshBasicMaterial({{ map: loadTex("albedo_delit.png", true) }});
+fetch("./opacity.png").then(r => r.ok ? r.blob() : null).then(blob => {{
+  if (!blob) return;
+  const img = new Image();
+  img.onload = () => {{
+    const c = document.createElement("canvas");
+    c.width = Math.min(img.width, 128); c.height = Math.min(img.height, 128);
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    let hasHoles = false;
+    for (let i = 0; i < d.length; i += 4) {{ if (d[i] < 245) {{ hasHoles = true; break; }} }}
+    if (hasHoles) {{
+      const opTex = loadTex("opacity.png", false);
+      pbrMat.alphaMap = opTex;
+      pbrMat.alphaTest = 0.5;
+      pbrMat.side = THREE.DoubleSide;
+      pbrMat.needsUpdate = true;
+    }}
+  }};
+  img.src = URL.createObjectURL(blob);
+}});
 
 const geoms = {{
   sphere: new THREE.SphereGeometry(1, 128, 128),

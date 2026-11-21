@@ -82,11 +82,31 @@ def _detect_size(src_dir: Path) -> tuple[int, int]:
     raise FileNotFoundError(f"No PBR maps found in {src_dir}")
 
 
+def _load_cutout_opacity(src_dir: Path, size: tuple[int, int] | None = None) -> tuple[bool, np.ndarray | None]:
+    """Return (has_cutout, uint8_array) when opacity.png exists and has transparent pixels (<250)."""
+    op_path = src_dir / "opacity.png"
+    if not op_path.exists():
+        return False, None
+    op = _load_gray(op_path, default=255, size=size)
+    return bool(int(op.min()) < 250), op
+
+
+def _save_rgba_with_opacity(rgb_path: Path, op_arr: np.ndarray, out_path: Path) -> None:
+    rgb = _load_rgb(rgb_path, size=(op_arr.shape[1], op_arr.shape[0]))
+    rgba = np.dstack([rgb, op_arr])
+    Image.fromarray(rgba, mode="RGBA").save(out_path)
+
+
 def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False) -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "BaseMap.png")
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    if has_cutout and op_arr is not None:
+        _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "BaseMap.png")
+    else:
+        _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "BaseMap.png")
+    _copy_if_exists(src_dir / "opacity.png", out_dir / "OpacityMask.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "NormalMap.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "HeightMap.png")
     _copy_if_exists(src_dir / "height16.png", out_dir / "HeightMap16.png")
@@ -137,18 +157,30 @@ def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False) -
             },
         }
 
+    if has_cutout:
+        manifest["alphaClip"] = True
+        manifest["alphaCutoff"] = 0.5
+        manifest["doubleSided"] = True
+        manifest["textures"]["OpacityMask"] = {"file": "OpacityMask.png", "sRGB": False}
     (out_dir / "unity_material.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return out_dir
 
 
 def _export_godot(src_dir: Path, out_dir: Path, name: str) -> Path:
+    size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "albedo.png")
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    if has_cutout and op_arr is not None:
+        _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "albedo.png")
+    else:
+        _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "albedo.png")
+    _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "height.png")
     _copy_if_exists(src_dir / "anisotropy.png", out_dir / "anisotropy.png")
 
+    cutout_block = "transparency = 2\nalpha_scissor_threshold = 0.5\ncull_mode = 2\n" if has_cutout else ""
     tres = f"""[gd_resource type="StandardMaterial3D" load_steps=5 format=3]
 
 [ext_resource type="Texture2D" path="albedo.png" id="1_albedo"]
@@ -175,7 +207,7 @@ heightmap_deep_parallax = true
 heightmap_min_layers = 8
 heightmap_max_layers = 32
 heightmap_texture = ExtResource("4_height")
-"""
+{cutout_block}"""
     (out_dir / "material.tres").write_text(tres)
     return out_dir
 
@@ -188,6 +220,8 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str) -> Path:
     _copy_if_exists(src_dir / "orm.png", out_dir / "T_ORM.png")
     _copy_if_exists(src_dir / "height16.png", out_dir / "T_Height16.png")
     _copy_if_exists(src_dir / "specular.png", out_dir / "T_Specular.png")
+    has_cutout, _ = _load_cutout_opacity(src_dir, size=size)
+    _copy_if_exists(src_dir / "opacity.png", out_dir / "T_OpacityMask.png")
 
     normal_gl = _load_rgb(src_dir / "normal.png", default=(128, 128, 255), size=size)
     Image.fromarray(_flip_normal_green(normal_gl), mode="RGB").save(out_dir / "T_Normal_DX.png")
@@ -213,6 +247,10 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str) -> Path:
             "Height": {"file": "T_Height16.png", "sRGB": False, "compression": "TC_Grayscale"},
         },
     }
+    if has_cutout:
+        manifest["blendMode"] = "BLEND_Masked"
+        manifest["twoSided"] = True
+        manifest["textures"]["OpacityMask"] = {"file": "T_OpacityMask.png", "sRGB": False, "compression": "TC_Masks"}
     (out_dir / "ue5_material.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return out_dir
 
@@ -227,6 +265,7 @@ def _export_blender(src_dir: Path, out_dir: Path, name: str) -> Path:
         ("ao.png", "ao.png"),
         ("height16.png", "height16.png"),
         ("specular.png", "specular.png"),
+        ("opacity.png", "opacity.png"),
     ):
         _copy_if_exists(src_dir / src_name, out_dir / dst_name)
 
@@ -295,6 +334,10 @@ def create_material(mat_name: str = "{name}") -> bpy.types.Material:
         nt.links.new(tex_h.outputs["Color"], disp.inputs["Height"])
         nt.links.new(disp.outputs["Displacement"], out.inputs["Displacement"])
 
+    tex_op = load_tex("opacity.png", "Non-Color", (-420, -1120))
+    if tex_op:
+        nt.links.new(tex_op.outputs["Color"], bsdf.inputs["Alpha"])
+
     return mat
 
 
@@ -315,9 +358,12 @@ def _export_threejs(src_dir: Path, out_dir: Path, name: str) -> Path:
         ("ao.png", "ao.png"),
         ("height.png", "displacement.png"),
         ("orm.png", "orm.png"),
+        ("opacity.png", "opacity.png"),
     ):
         _copy_if_exists(src_dir / src_name, out_dir / dst_name)
 
+    has_cutout, _ = _load_cutout_opacity(src_dir)
+    alpha_block = "\n    alphaMap: load(\"opacity.png\", false),\n    alphaTest: 0.5,\n    side: THREE.DoubleSide," if has_cutout else ""
     js = f"""// Auto-generated Three.js MeshPhysicalMaterial factory for `{name}`
 import * as THREE from "three";
 
@@ -346,7 +392,7 @@ export function createMaterial(
     displacementMap: load("displacement.png", false),
     displacementScale,
     roughness: 1.0,
-    metalness: 1.0,
+    metalness: 1.0,{alpha_block}
   }});
 }}
 """
@@ -355,8 +401,14 @@ export function createMaterial(
 
 
 def _export_gltf(src_dir: Path, out_dir: Path, name: str) -> Path:
+    size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "baseColor.png")
+    has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size)
+    if has_cutout and op_arr is not None:
+        _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "baseColor.png")
+    else:
+        _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "baseColor.png")
+    _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
 
@@ -394,6 +446,10 @@ def _export_gltf(src_dir: Path, out_dir: Path, name: str) -> Path:
             }
         ],
     }
+    if has_cutout:
+        gltf["materials"][0]["alphaMode"] = "MASK"
+        gltf["materials"][0]["alphaCutoff"] = 0.5
+        gltf["materials"][0]["doubleSided"] = True
     (out_dir / "material.gltf").write_text(json.dumps(gltf, indent=2) + "\n")
     return out_dir
 
@@ -461,8 +517,11 @@ def _export_vulkan(src_dir: Path, out_dir: Path, name: str) -> Path:
 
 def _export_materialx(src_dir: Path, out_dir: Path, name: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png"):
+    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png", "opacity.png"):
         _copy_if_exists(src_dir / fname, out_dir / fname)
+    has_cutout, _ = _load_cutout_opacity(src_dir)
+    op_ng = '\n    <image name="img_opacity" type="float"><input name="file" type="filename" value="opacity.png" colorspace="lin_rec709" /></image>\n    <output name="out_opacity" type="float" nodename="img_opacity" />' if has_cutout else ""
+    op_sr = f'\n    <input name="opacity" type="float" nodegraph="NG_{name}" output="out_opacity" />' if has_cutout else ""
 
     mtlx = f"""<?xml version="1.0"?>
 <materialx version="1.38">
@@ -489,14 +548,14 @@ def _export_materialx(src_dir: Path, out_dir: Path, name: str) -> Path:
     <output name="out_roughness" type="float" nodename="img_roughness" />
     <output name="out_metallic" type="float" nodename="img_metallic" />
     <output name="out_normal" type="vector3" nodename="nrm_map" />
-    <output name="out_height" type="float" nodename="img_height" />
+    <output name="out_height" type="float" nodename="img_height" />{op_ng}
   </nodegraph>
 
   <standard_surface name="SR_{name}" type="surfaceshader">
     <input name="base_color" type="color3" nodegraph="NG_{name}" output="out_albedo" />
     <input name="specular_roughness" type="float" nodegraph="NG_{name}" output="out_roughness" />
     <input name="metalness" type="float" nodegraph="NG_{name}" output="out_metallic" />
-    <input name="normal" type="vector3" nodegraph="NG_{name}" output="out_normal" />
+    <input name="normal" type="vector3" nodegraph="NG_{name}" output="out_normal" />{op_sr}
   </standard_surface>
 
   <displacement name="DISP_{name}" type="displacementshader">
@@ -577,12 +636,20 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
     bv_uv = add_view(uv.tobytes(), target=34962)
     bv_idx = add_view(idx.tobytes(), target=34963)
 
+    import io
+    has_cutout, op_arr = _load_cutout_opacity(src_dir)
     img_views: list[int] = []
     for fname in ("albedo_delit.png", "orm.png", "normal.png"):
         p = src_dir / fname
         if not p.exists():
             raise FileNotFoundError(f"Required map missing for GLB export: {p}")
-        img_views.append(add_view(p.read_bytes()))
+        if fname == "albedo_delit.png" and has_cutout and op_arr is not None:
+            rgb = _load_rgb(p, size=(op_arr.shape[1], op_arr.shape[0]))
+            buf = io.BytesIO()
+            Image.fromarray(np.dstack([rgb, op_arr]), mode="RGBA").save(buf, format="PNG")
+            img_views.append(add_view(buf.getvalue()))
+        else:
+            img_views.append(add_view(p.read_bytes()))
 
     bin_data = b"".join(bin_chunks)
     gltf_doc: dict[str, Any] = {
@@ -644,6 +711,10 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
         ],
     }
 
+    if has_cutout:
+        gltf_doc["materials"][0]["alphaMode"] = "MASK"
+        gltf_doc["materials"][0]["alphaCutoff"] = 0.5
+        gltf_doc["materials"][0]["doubleSided"] = True
     json_bytes = json.dumps(gltf_doc, separators=(",", ":")).encode("utf-8")
     json_pad = (-len(json_bytes)) % 4
     json_bytes += b" " * json_pad
@@ -662,13 +733,27 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str) -> Path:
 def _export_usd(src_dir: Path, out_dir: Path, name: str) -> Path:
     """Export an OpenUSD ASCII (.usda) UsdPreviewSurface material (RealityKit / Omniverse / Houdini)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png"):
+    for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png", "opacity.png"):
         _copy_if_exists(src_dir / fname, out_dir / fname)
+    has_cutout, _ = _load_cutout_opacity(src_dir)
 
     safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
     if not safe or safe[0].isdigit():
         safe = f"M_{safe}"
 
+    usd_op_conn = f"\n            float inputs:opacity.connect = </{safe}_Root/{safe}/TexOpacity.outputs:r>\n            float inputs:opacityThreshold = 0.5" if has_cutout else ""
+    usd_op_node = f"""
+
+        def Shader "TexOpacity"
+        {{{{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./opacity.png@
+            token inputs:sourceColorSpace = "raw"
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            float outputs:r
+        }}}}""" if has_cutout else ""
     usda = f"""#usda 1.0
 (
     defaultPrim = "{safe}_Root"
@@ -690,7 +775,7 @@ def Xform "{safe}_Root"
             float inputs:roughness.connect = </{safe}_Root/{safe}/TexRoughness.outputs:r>
             float inputs:occlusion.connect = </{safe}_Root/{safe}/TexAO.outputs:r>
             normal3f inputs:normal.connect = </{safe}_Root/{safe}/TexNormal.outputs:rgb>
-            float inputs:ior = 1.5
+            float inputs:ior = 1.5{usd_op_conn}
             token outputs:surface
         }}
 
@@ -756,7 +841,7 @@ def Xform "{safe}_Root"
             token inputs:wrapT = "repeat"
             float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
             normal3f outputs:rgb
-        }}
+        }}{usd_op_node}
     }}
 }}
 """

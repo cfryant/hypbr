@@ -211,7 +211,11 @@ def blend_materials(
     orm_u8 = np.stack([hbao["ao_u8"], rough_u8, met_u8], axis=-1)
 
     # 5. Physically-based studio preview (with metallic Fresnel IBL)
-    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao)
+    op_a = _load_gray_f32(pa / "opacity.png", size, 1.0)
+    op_b = _load_gray_f32(pb / "opacity.png", size, 1.0)
+    op_f = np.clip((1.0 - surf_mask) * op_a + surf_mask * op_b, 0.0, 1.0).astype(np.float32)
+    op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao, opacity=op_f)
 
     save_maps_parallel([
         (out / "albedo_delit.png", alb_u8),
@@ -230,6 +234,7 @@ def blend_materials(
         (out / "anisotropy.png", aniso["anisotropy_u8"]),
         (out / "specular.png", aniso["specular_u8"]),
         (out / "thickness.png", thick["thickness_u8"]),
+        (out / "opacity.png", op_u8),
         (out / "blend_mask.png", np.clip(surf_mask * 255.0 + 0.5, 0, 255).astype(np.uint8)),
     ])
     return out

@@ -49,6 +49,45 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
     met = np.zeros((H, W), dtype=np.float32)
     r_mod = np.zeros((H, W), dtype=np.float32)
 
+    if did == "chainlink_fence_galvanized":
+        # Galvanized zinc spangle facets + light rust patches & downward drip streaks
+        f1_a, _ = gd._periodic_worley(u, v, 34, seed + 210)
+        f1_b, _ = gd._periodic_worley(u, v, 68, seed + 211)
+        spangle = np.clip(0.55 * (1.0 - f1_a) + 0.45 * (1.0 - f1_b), 0.0, 1.0)
+        zinc_lo = np.array([0.44, 0.47, 0.51], np.float32)[None, None, :]
+        zinc_hi = np.array([0.70, 0.73, 0.76], np.float32)[None, None, :]
+        steel = zinc_lo * (1.0 - spangle[..., None]) + zinc_hi * spangle[..., None]
+        steel *= (0.94 + 0.08 * m1[..., None])
+
+        # Vertical rainwater drip streaks + fine granular pitted rust flecks (knuckle-biased)
+        drip = gd._periodic_fbm(H, W, seed + 221, (24, 3))
+        drip_fine = gd._periodic_fbm(H, W, seed + 222, (48, 8))
+        patch = gd._periodic_fbm(H, W, seed + 223, (4, 8, 16))
+        flakes = gd._periodic_fbm(H, W, seed + 224, (32, 64, 128))
+        # Subtle oxide tarnish halo + crisp granular rust core
+        rust_drive = 0.34 * patch + 0.32 * drip + 0.18 * drip_fine + 0.28 * flakes + 0.20 * (1.0 - ao)
+        rust_halo = gd._smoothstep(0.34, 0.56, rust_drive) * (1.0 - gd._smoothstep(0.65, 0.90, cav))
+        rust_m = gd._smoothstep(0.46, 0.66, rust_drive + 0.16 * flakes) * (1.0 - gd._smoothstep(0.65, 0.90, cav))
+
+        rust_dark = np.array([0.16, 0.055, 0.018], np.float32)[None, None, :]
+        rust_sienna = np.array([0.30, 0.105, 0.032], np.float32)[None, None, :]
+        rust_ochre = np.array([0.44, 0.210, 0.068], np.float32)[None, None, :]
+        rust_t = np.clip(0.5 + 0.65 * flakes, 0.0, 1.0)[..., None]
+        rust_col = rust_dark * (1.0 - rust_t) + (rust_sienna * 0.6 + rust_ochre * 0.4) * rust_t
+        # Blend subtle dull zinc-oxide stain around rust edges before deep rust core
+        steel = steel * (1.0 - 0.35 * rust_halo[..., None]) + np.array([0.36, 0.32, 0.29], np.float32)[None, None, :] * (0.35 * rust_halo[..., None])
+
+        alb = steel * (1.0 - rust_m[..., None]) + rust_col * rust_m[..., None]
+        # Keep hole pixels neutral galvanized tone for clean mipmap alpha-cutout edges
+        hole_m = gd._smoothstep(0.65, 0.92, cav)[..., None]
+        alb = alb * (1.0 - hole_m) + np.array([0.52, 0.54, 0.57], np.float32)[None, None, :] * hole_m
+
+        met = np.clip(0.93 * (1.0 - 0.88 * rust_m) + 0.04 * ridge, 0.05, 0.96).astype(np.float32)
+        r_mod = (-0.06 * spangle + 0.04 * (1.0 - ao) + 0.58 * rust_m).astype(np.float32)
+        alb_u8 = np.clip(np.power(np.clip(alb, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        met_u8 = np.clip(met * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        return alb_u8, alb.astype(np.float32), met_u8, r_mod
+
     if did == "subway_metro_tile":
         # Warm glossy off-white ceramic face + cool gray matte sanded mortar grout
         tile_col = np.array([0.86, 0.87, 0.84], np.float32)[None, None, :] * (0.96 + 0.04 * m1[..., None])
@@ -502,6 +541,7 @@ def synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path:
         (out_dir / "anisotropy.png", aniso["anisotropy_u8"]),
         (out_dir / "specular.png", aniso["specular_u8"]),
         (out_dir / "thickness.png", thick["thickness_u8"]),
+        (out_dir / "opacity.png", np.full((H, W), 255, dtype=np.uint8)),
     ])
     return out_dir
 
@@ -531,6 +571,7 @@ def render_studio_preview(
     rough: np.ndarray,
     met: np.ndarray,
     ao: np.ndarray,
+    opacity: np.ndarray | None = None,
 ) -> np.ndarray:
     """Physically-based Cook-Torrance GGX + Lagarde Fresnel IBL studio preview (zero matte plastic glare)."""
     if dp.DEVICE.type != "cpu" and rough.size >= 262144:
@@ -593,6 +634,9 @@ def render_studio_preview(
         col = diffuse + spec_ibl + spec_direct
         # Smooth ACES-like highlight roll-off
         col = col / (1.0 + 0.26 * col)
+        if opacity is not None and float(opacity.min()) < 0.99:
+            col_np = col.cpu().numpy()
+            return _composite_cutout_preview(col_np, opacity)
         out_u8 = torch.clamp(torch.pow(torch.clamp(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0.0, 255.0).to(torch.uint8)
         return out_u8.cpu().numpy()
 
@@ -652,7 +696,25 @@ def render_studio_preview(
     diffuse = diff_col * (0.24 + 0.86 * ndotl1[..., None] + 0.26 * ndotl2[..., None]) * (0.28 + 0.72 * ao3)
     col = diffuse + spec_ibl + spec_direct
     col = col / (1.0 + 0.26 * col)
+    if opacity is not None and float(opacity.min()) < 0.99:
+        return _composite_cutout_preview(col, opacity)
     return np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _composite_cutout_preview(col_lin: np.ndarray, opacity: np.ndarray) -> np.ndarray:
+    """Composite alpha-cutout material preview over a neutral dark-slate studio checker + cast shadow."""
+    H, W = opacity.shape
+    chk = 32
+    yy, xx = np.mgrid[0:H, 0:W]
+    c = ((yy // chk) + (xx // chk)) % 2
+    bg = np.where(c[..., None] == 0, 0.08, 0.13).astype(np.float32) * np.ones((1, 1, 3), np.float32)
+    # Soft offset shadow from the wire/cutout silhouette
+    sh_shift = max(4, H // 48)
+    shad = np.roll(np.roll(opacity, sh_shift, axis=0), sh_shift, axis=1)
+    bg = bg * (1.0 - 0.65 * shad[..., None])
+    op = np.clip(opacity, 0.0, 1.0)[..., None]
+    out_lin = col_lin * op + bg * (1.0 - op)
+    return np.clip(np.power(np.clip(out_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
 def synthesize_material(
@@ -785,7 +847,12 @@ def synthesize_material(
         met_u8 = np.clip(met_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": N}, strength=0.25, max_boost=0.08)["roughness"]
-    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao)
+    if material_id in getattr(gd, "TRANSPARENT_MATERIALS", ()):
+        op_f = np.clip(1.0 - gd._smoothstep(0.52, 0.82, cav0), 0.0, 1.0).astype(np.float32)
+    else:
+        op_f = np.ones((H, W), dtype=np.float32)
+    op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao, opacity=op_f)
 
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface({"circular": True}, {"height": h_n})
@@ -809,6 +876,7 @@ def synthesize_material(
         (d / "anisotropy.png", aniso["anisotropy_u8"]),
         (d / "specular.png", aniso["specular_u8"]),
         (d / "thickness.png", thick["thickness_u8"]),
+        (d / "opacity.png", op_u8),
     ])
     return d
 

@@ -2098,6 +2098,8 @@ def main():
         Image.fromarray(aniso_u8).save(sub / "anisotropy.png")
         Image.fromarray(spec_u8).save(sub / "specular.png")
         Image.fromarray(thick_u8).save(sub / "thickness.png")
+        op_u8 = get_out(state, outs["opacity"]) if "opacity" in outs else np.full((args.size, args.size), 255, np.uint8)
+        Image.fromarray(op_u8).save(sub / "opacity.png")
         (sub / "graph.json").write_text(json.dumps(graph, indent=2))
 
         dp.make_comparison_sheet([

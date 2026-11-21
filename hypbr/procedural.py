@@ -257,7 +257,10 @@ DAILY_CATALOG = [
     ("woven_bamboo_tatami",      "Traditional Japanese woven tatami / bamboo strip mat with reed grain",   "natural", (0.64, 0.60, 0.40)),
     ("travertine_porous_stone",  "Honed Roman travertine limestone with banded horizontal erosion pores",  "stone",   (0.76, 0.69, 0.58)),
     ("gilded_tin_ceiling_tile",  "Embossed vintage pressed-tin ceiling relief in antique champagne brass", "brass",   (0.74, 0.60, 0.34)),
+    ("chainlink_fence_galvanized","Woven diamond galvanized steel chain-link fence with over-under crossings, light rust & transparent holes", "metal", (0.58, 0.61, 0.64)),
 ]
+
+TRANSPARENT_MATERIALS = frozenset({"chainlink_fence_galvanized"})
 
 WEAR_STATES = ("0_fresh", "1_lived_in", "2_weathered")
 
@@ -550,6 +553,56 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
         cav = open_gap
         ridge = _smoothstep(0.60, 0.95, hood) * in_slot
         return h.astype(np.float32), 19.0, cav.astype(np.float32), 0.34, ridge.astype(np.float32)
+
+    if detail_id == "chainlink_fence_galvanized":
+        # High-detail woven diamond galvanized steel chain-link fence with real over-under crossings,
+        # uniform cylindrical wire thickness (slope-corrected orthogonal distance), zinc spangle relief,
+        # and crisp open holes (cav = 1 - wire_mask -> opacity.png cutout).
+        nx, ny = 5.0, 5.0
+        phase = 2.0 * math.pi * v * ny
+        # Smoothly rounded triangle wave for classic diamond chain-link wire bends
+        s_phi = np.sin(phase)
+        c_phi = np.cos(phase)
+        amp = 0.285
+        # Use arcsin(0.94 * sin) for crisp diamond straight runs with smooth rounded hooks at knuckles
+        zv_a = amp * (2.0 / math.pi) * np.arcsin(0.94 * s_phi)
+        zv_b = -zv_a
+        # Derivative dz/dv (in cell units) to compute orthogonal distance to the diagonal wire!
+        dz_dv = amp * (2.0 / math.pi) * (0.94 * c_phi * 2.0 * math.pi * (ny / nx)) / np.sqrt(np.maximum(0.06, 1.0 - (0.94 * s_phi) ** 2))
+        ortho_scale = 1.0 / np.sqrt(1.0 + dz_dv * dz_dv)
+
+        da_h = np.abs((((u * nx - 0.25 - zv_a) + 0.5) % 1.0) - 0.5)
+        db_h = np.abs((((u * nx - 0.75 - zv_b) + 0.5) % 1.0) - 0.5)
+        da = da_h * ortho_scale
+        db = db_h * ortho_scale
+
+        r_wire = 0.088
+        wa = np.sqrt(np.clip(1.0 - (da / r_wire) ** 2, 0.0, 1.0))
+        wb = np.sqrt(np.clip(1.0 - (db / r_wire) ** 2, 0.0, 1.0))
+
+        # Helical Z-depth: wire A passes OVER wire B at upper knuckle (cos > 0) and UNDER at lower knuckle (cos < 0)
+        za = 0.68 + 0.28 * c_phi
+        zb = 0.68 - 0.28 * c_phi
+        ha = wa * za
+        hb = wb * zb
+        upper_a = ha >= hb
+        wire_h = np.maximum(ha, hb)
+
+        # Fine longitudinal drawing/twist striations + zinc spangle micro-relief on wire surface
+        spangle = _periodic_worley(u, v, 40, seed + 11)[0]
+        twist_groove = 0.014 * np.sin(2.0 * math.pi * (u * nx * 6.0 + v * ny * 6.0))
+        wire_mask = _smoothstep(0.02, 0.14, np.maximum(wa, wb))
+
+        # Slight contact-collar bevel where wires hook together
+        knuckle = np.minimum(wa, wb)
+        wire_h = np.clip(wire_h + 0.05 * knuckle + (0.018 * (1.0 - spangle) + twist_groove) * wire_mask, 0.0, 1.0)
+
+        h = 0.02 + 0.92 * wire_h
+        # cav = 1.0 in open diamond holes, 0.0 on solid steel wires; subtle dip at under-wire crossing
+        under_crease = np.where(upper_a, wb * 0.15, wa * 0.15) * np.clip(knuckle * 4.0, 0.0, 1.0)
+        cav = np.clip((1.0 - wire_mask) + under_crease * 0.25, 0.0, 1.0)
+        ridge = _smoothstep(0.62, 0.92, wire_h) * wire_mask
+        return h.astype(np.float32), 20.0, cav.astype(np.float32), 0.24, ridge.astype(np.float32)
 
     if detail_id == "chainlink_wire_mesh":
         # Authentic interlocking helical zigzag galvanized steel chain-link fence over deep open void!
