@@ -1,5 +1,7 @@
 # hypbr
 
+[![CI](https://github.com/wrong-nebula/hypbr/actions/workflows/ci.yml/badge.svg)](https://github.com/wrong-nebula/hypbr/actions/workflows/ci.yml)
+
 **Hybrid Neural + Exact Periodic Procedural PBR Material Synthesizer**
 
 `hypbr` synthesizes seamlessly tileable, physically calibrated **15-map PBR material sets** (glTF 2.0 ORM, 16-bit height, OpenGL/DirectX tangent normals, 8-azimuth horizon-based AO, bent normals, curvature, anisotropy, specular, and subsurface thickness) at arbitrary resolution with zero border seams.
@@ -40,10 +42,22 @@ List built-in procedural materials:
 hypbr list
 ```
 
-Synthesize a single seamless 15-map PBR material at `1024x1024`:
+Synthesize a single seamless 15-map PBR material at `1024x1024` (with optional physical weathering `--wear 0.0..1.0`):
 
 ```bash
-hypbr synth patinated_verdigris_bronze --size 1024 --out ./output/pbr
+hypbr synth patinated_verdigris_bronze --size 1024 --wear 0.35 --out ./output/pbr
+```
+
+Physically blend two materials using Unreal/Substance-style HeightLerp (`height`, `cavity`, or `linear`) with recomputed 8-azimuth HBAO, curvature, and ORM:
+
+```bash
+hypbr blend ./output/pbr/hammered_copper_dimple ./output/pbr/venetian_plaster_trowel --mode cavity --factor 0.45 --out ./output/pbr/copper_plaster
+```
+
+Inspect any synthesized or blended material in a local interactive Three.js PBR studio (channel switcher, live displacement, UV tiling, orbit lighting):
+
+```bash
+hypbr preview ./output/pbr/patinated_verdigris_bronze
 ```
 
 Synthesize and export directly to game engines & 3D tools in one command:
@@ -133,7 +147,7 @@ with open("custom_graph.json", "w") as f:
     json.dump(graph, f, indent=2)
 ```
 
-See runnable scripts in [`examples/synthesize_pbr.py`](examples/synthesize_pbr.py), [`examples/export_engines.py`](examples/export_engines.py), and [`examples/custom_graph.py`](examples/custom_graph.py).
+See runnable scripts in [`examples/synthesize_pbr.py`](examples/synthesize_pbr.py), [`examples/export_engines.py`](examples/export_engines.py), [`examples/blend_and_weather.py`](examples/blend_and_weather.py), and [`examples/custom_graph.py`](examples/custom_graph.py).
 
 ## Engine & Standard I/O Targets
 
@@ -182,6 +196,8 @@ Every material synthesis writes a clean, renderer-ready directory compatible wit
 - [`hypbr/weightcode.py`](hypbr/weightcode.py): Zero-training analytic weight surgery (exact 9-mode orthonormal 3×3 spatial kernel filtering, SVD energy shrinkage, circular Conv2d padding, and 4-quadrant partition-of-unity tileable blending).
 - [`hypbr/depthpro_pbr.py`](hypbr/depthpro_pbr.py): Optional Apple Depth Pro + DeepBump ONNX neural relief extractor with 4-rotation perspective cancellation and GPU-accelerated Gaussian/HBAO kernels (`HYPBR_DEVICE=cpu|mps|cuda`).
 - [`hypbr/exporters.py`](hypbr/exporters.py): Zero-dependency engine & standard exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `glb`, `vulkan`, `materialx`, `usd`).
+- [`hypbr/blend.py`](hypbr/blend.py): Physically based 16-bit HeightLerp / cavity material blending (`hypbr blend`) with linear-light albedo mixing and recomputed HBAO/curvature/ORM.
+- [`hypbr/preview.py`](hypbr/preview.py): Zero-dependency local interactive Three.js PBR studio viewer (`hypbr preview`) with per-channel inspection, tiling, and displacement controls.
 - [`hypbr/verify.py`](hypbr/verify.py): Automated seamlessness, tangent normal validity, Helmholtz curl, ORM consistency, and PBR calibration QA verifier (`hypbr verify`).
 - [`hypbr/cli.py`](hypbr/cli.py): `hypbr` command-line interface.
 

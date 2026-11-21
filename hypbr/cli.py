@@ -8,7 +8,9 @@ import time
 from pathlib import Path
 
 from . import normal_graph as ng
+from .blend import blend_materials
 from .exporters import SUPPORTED_TARGETS, export_material
+from .preview import serve_preview
 from .synthesize import list_materials, synthesize_all, synthesize_hardops_plate, synthesize_material
 from .verify import verify_material
 
@@ -32,14 +34,14 @@ def _resolve_targets(raw: str) -> list[str]:
 def cmd_synth(args: argparse.Namespace) -> int:
     t0 = time.time()
     if args.material == "all":
-        paths = synthesize_all(args.out, size=args.size)
+        paths = synthesize_all(args.out, size=args.size, wear=args.wear)
         print(f"Synthesized {len(paths)} seamless 15-map PBR sets in {time.time() - t0:.1f}s -> {args.out}")
     elif args.material == "hardops_plate":
         paths = [synthesize_hardops_plate(args.out / "hardops_plate", size=args.size)]
         print(f"Synthesized hardops_plate in {time.time() - t0:.2f}s -> {paths[0]}")
     else:
-        paths = [synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed)]
-        print(f"Synthesized {args.material} (15 maps, {args.size}x{args.size}) in {time.time() - t0:.2f}s -> {paths[0]}")
+        paths = [synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed, wear=args.wear)]
+        print(f"Synthesized {args.material} (15 maps, {args.size}x{args.size}, wear={args.wear:.2f}) in {time.time() - t0:.2f}s -> {paths[0]}")
 
     if args.export:
         targets = _resolve_targets(args.export)
@@ -59,6 +61,18 @@ def cmd_export(args: argparse.Namespace) -> int:
         dst = args.out if (len(targets) == 1 and not args.subdir) else (args.out / tgt)
         export_material(src, dst, target=tgt, name=mat_name)
         print(f"Exported [{tgt:10s}] -> {dst}")
+    return 0
+
+
+def cmd_blend(args: argparse.Namespace) -> int:
+    t0 = time.time()
+    out = blend_materials(args.dir_a, args.dir_b, args.out, factor=args.factor, contrast=args.contrast, mode=args.mode)
+    print(f"Blended {args.dir_a.name} + {args.dir_b.name} (mode={args.mode}, factor={args.factor:.2f}) in {time.time() - t0:.2f}s -> {out}")
+    return 0
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    serve_preview(args.dir, host=args.host, port=args.port, open_browser=not args.no_open)
     return 0
 
 
@@ -123,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_synth.add_argument("--out", type=Path, default=Path("./output/pbr"), help="Output directory")
     p_synth.add_argument("--size", type=int, default=512, help="Square texture resolution (default: 512)")
     p_synth.add_argument("--seed", type=int, default=None, help="Optional deterministic seed override")
+    p_synth.add_argument("--wear", type=float, default=0.0, help="Weathering intensity 0.0 (fresh) to 1.0 (weathered)")
     p_synth.add_argument(
         "--export",
         type=str,
@@ -142,6 +157,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.add_argument("--name", type=str, default=None, help="Optional material name override")
     p_exp.add_argument("--subdir", action="store_true", help="Always write into <out>/<target>/ even for a single target")
     p_exp.set_defaults(func=cmd_export)
+
+    p_blend = sub.add_parser("blend", help="Physically blend two hypbr materials via height-lerp, cavity, or linear mode")
+    p_blend.add_argument("dir_a", type=Path, help="Base material directory A")
+    p_blend.add_argument("dir_b", type=Path, help="Overlay material directory B")
+    p_blend.add_argument("--out", type=Path, required=True, help="Output directory for blended material")
+    p_blend.add_argument("--factor", type=float, default=0.5, help="Blend amount of B over A in [0, 1] (default: 0.5)")
+    p_blend.add_argument("--contrast", type=float, default=0.15, help="Height transition sharpness (default: 0.15)")
+    p_blend.add_argument("--mode", choices=("height", "cavity", "linear"), default="height", help="Blend mode")
+    p_blend.set_defaults(func=cmd_blend)
+
+    p_prev = sub.add_parser("preview", help="Launch a local interactive Three.js PBR studio preview")
+    p_prev.add_argument("dir", type=Path, help="Material directory to inspect")
+    p_prev.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p_prev.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    p_prev.add_argument("--no-open", action="store_true", help="Do not automatically open the browser")
+    p_prev.set_defaults(func=cmd_preview)
 
     p_ver = sub.add_parser("verify", help="Verify seamlessness, normal validity, ORM packing, and PBR physical ranges")
     p_ver.add_argument("dir", type=Path, help="Material directory to verify")

@@ -421,8 +421,22 @@ def list_materials() -> list[dict[str, str]]:
     ]
 
 
-def synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, seed: int | None = None) -> Path:
-    """Synthesize a complete seamless 15-map PBR material set into `out_dir`."""
+def synthesize_material(
+    material_id: str,
+    out_dir: Path | str,
+    size: int = 512,
+    seed: int | None = None,
+    wear: float = 0.0,
+) -> Path:
+    """Synthesize a complete seamless 15-map PBR material set into `out_dir`.
+
+    Args:
+        material_id: Built-in material ID (see `list_materials()`).
+        out_dir: Destination directory.
+        size: Square output resolution in pixels (default: 512).
+        seed: Optional deterministic seed override.
+        wear: Physical weathering intensity in `[0.0, 1.0]` (`0.0`=fresh, `0.5`=lived-in, `1.0`=weathered).
+    """
     catalog_map = {did: (idx, desc, mat_kind, tint) for idx, (did, desc, mat_kind, tint) in enumerate(gd.DAILY_CATALOG)}
     if material_id not in catalog_map:
         raise KeyError(f"Unknown material_id '{material_id}'. Use list_materials() to see available IDs.")
@@ -431,20 +445,38 @@ def synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, 
     d.mkdir(parents=True, exist_ok=True)
     H = W = size
     s_base = (2000 + idx * 41) if seed is None else seed
+    w_amt = float(np.clip(wear, 0.0, 1.0))
 
     h0, slope_scale, cav0, base_r, ridge0 = gd.build_daily_detail(material_id, H, W, seed=s_base)
     h_n = dp.normalize_height(h0, clip_pct=0.5)
     N = gd._height_to_normal_periodic(h0, slope=slope_scale)
     g_kind = "mineral" if mat_kind in ("concrete", "ceramic") else ("brushed" if mat_kind in ("metal", "carbon") else "cast")
     g_str = 0.04 if mat_kind in ("ceramic", "carbon") else 0.065
-    N = ng.node_micro_grain({"circular": True}, {"normal": N}, kind=g_kind, scale=36.0, strength=g_str, seed=s_base + 1000)["normal"]
+    N = ng.node_micro_grain({"circular": True}, {"normal": N}, kind=g_kind, scale=36.0, strength=g_str + 0.03 * w_amt, seed=s_base + 1000)["normal"]
     N = ng.node_normal_clamp_slope({"circular": True}, {"normal": N}, max_angle_deg=58.0)["normal"]
 
     hbao = ng.node_horizon_bent_normal_ao({"circular": True}, {"height": h_n, "normal": N}, strength=1.50, height_scale=18.0)
     ao = hbao["ao"]
+    curv = ng.node_curvature_multiscale({"circular": True}, {"normal": N}, gain=2.8)
     alb_u8, alb_lin, met_u8, r_mod = _rich_albedo_and_metal(material_id, mat_kind, tint, h_n, cav0, ridge0, ao, seed=s_base + 2000)
 
     rough = np.clip(base_r + r_mod + 0.24 * (1.0 - ao), 0.08, 0.96).astype(np.float32)
+    met_f = met_u8.astype(np.float32) / 255.0
+
+    if w_amt > 1e-4:
+        w_noise = np.clip(0.5 + 0.35 * gd._periodic_fbm(H, W, s_base + 7777, (4, 8, 16, 32)), 0.0, 1.0)
+        grime = np.clip((1.0 - ao) * (0.55 + 0.9 * w_noise) * w_amt, 0.0, 0.85)
+        edge_scuff = np.clip(curv["convex"] * (0.45 + 0.85 * w_noise) * w_amt, 0.0, 0.85)
+        grime_col = np.array([0.075, 0.068, 0.058], dtype=np.float32)[None, None, :]
+        scuff_col = np.clip(alb_lin * 1.25 + 0.06, 0.0, 0.92)
+        alb_lin = alb_lin * (1.0 - grime[..., None] * 0.65) + grime_col * (grime[..., None] * 0.65)
+        alb_lin = alb_lin * (1.0 - edge_scuff[..., None] * 0.35) + scuff_col * (edge_scuff[..., None] * 0.35)
+        alb_u8 = np.clip(np.power(np.clip(alb_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+        # Cavities get rougher & oxidized; metallic crests slightly polish while dielectric edges scuff
+        rough = np.clip(rough + 0.28 * grime + (0.14 * (1.0 - met_f) - 0.10 * met_f) * edge_scuff + 0.06 * w_amt * w_noise, 0.08, 0.97).astype(np.float32)
+        met_f = np.clip(met_f * (1.0 - 0.55 * grime), 0.0, 1.0).astype(np.float32)
+        met_u8 = np.clip(met_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
     rough = ng.node_roughness_specular_aa({"circular": True}, {"roughness": rough, "normal": N}, strength=0.25, max_boost=0.08)["roughness"]
 
     L1 = np.array([0.48, 0.52, 0.71], np.float32); L1 /= np.linalg.norm(L1)
@@ -454,13 +486,11 @@ def synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, 
     ndotl2 = np.clip((N * L2[None, None, :]).sum(-1), 0.0, 1.0)
     ndoth1 = np.clip((N * H1[None, None, :]).sum(-1), 0.0, 1.0)
     shin = np.clip(2.0 / (np.maximum(rough, 0.08) ** 2.4) - 2.0, 2.0, 180.0)
-    met_f = met_u8.astype(np.float32) / 255.0
     spec_col = (1.0 - met_f[..., None]) * 0.8 + met_f[..., None] * alb_lin
     spec = (ndoth1 ** shin)[..., None] * (1.0 - rough[..., None] * 0.80) * 0.75 * spec_col
     col = alb_lin * (0.18 + 0.80 * ndotl1[..., None] + 0.22 * ndotl2[..., None]) * (0.28 + 0.72 * ao[..., None]) + spec * (0.35 + 0.65 * ao[..., None])
     prev_u8 = np.clip(np.power(np.clip(col, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
-    curv = ng.node_curvature_multiscale({"circular": True}, {"normal": N}, gain=2.8)
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface({"circular": True}, {"height": h_n})
     rough_u8 = np.clip(rough * 255.0 + 0.5, 0, 255).astype(np.uint8)
@@ -485,11 +515,16 @@ def synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, 
     return d
 
 
-def synthesize_all(out_dir: Path | str, size: int = 512, materials: list[str] | None = None) -> list[Path]:
+def synthesize_all(
+    out_dir: Path | str,
+    size: int = 512,
+    materials: list[str] | None = None,
+    wear: float = 0.0,
+) -> list[Path]:
     """Synthesize all (or selected) seamless materials into `out_dir/<material_id>/`."""
     root = Path(out_dir)
     ids = materials if materials is not None else [did for did, *_ in gd.DAILY_CATALOG]
-    return [synthesize_material(mid, root / mid, size=size) for mid in ids]
+    return [synthesize_material(mid, root / mid, size=size, wear=wear) for mid in ids]
 
 
 def main():

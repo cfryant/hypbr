@@ -10,7 +10,9 @@
 ## CLI Commands
 
 - `hypbr list` — List built-in seamless procedural material IDs and categories.
-- `hypbr synth <material_id|hardops_plate|all> --size 512 --out ./output/pbr [--seed 42] [--export unity,godot,unreal,blender,threejs,gltf,glb,vulkan,materialx,usd|all]` — Synthesize a complete 15-map seamless PBR material set and optionally export to target engines.
+- `hypbr synth <material_id|hardops_plate|all> --size 512 --out ./output/pbr [--seed 42] [--wear 0.0..1.0] [--export unity,godot,unreal,blender,threejs,gltf,glb,vulkan,materialx,usd|all]` — Synthesize a complete 15-map seamless PBR material set with optional physical weathering and engine export.
+- `hypbr blend <dir_a> <dir_b> --out <out_dir> [--mode height|cavity|linear] [--factor 0.5] [--contrast 0.15]` — Physically blend two `hypbr` materials via 16-bit HeightLerp/cavity masking with linear-light albedo and recomputed HBAO/curvature/ORM.
+- `hypbr preview <material_dir> [--host 127.0.0.1] [--port 8765] [--no-open]` — Launch a zero-dependency local Three.js PBR material inspector in the browser.
 - `hypbr export <src_dir> --target <unity|unity-hdrp|godot|unreal|blender|threejs|gltf|glb|vulkan|materialx|usd|all> --out <out_dir>` — Export an existing `hypbr` material directory with engine-native channel packing, normal convention, and material definition files.
 - `hypbr verify <material_dir> [--json] [--seam-limit 2.2]` — Automated physical calibration, ORM consistency, normal validity, and wrap-around seamlessness QA check (CI exit code 0/1).
 - `hypbr dump-preset [v13-default]` — Export a built-in composable PBR node graph preset as JSON.
@@ -18,7 +20,8 @@
 
 ## Python API
 
-- `from hypbr import list_materials, synthesize_material, synthesize_all, synthesize_hardops_plate, export_material, verify_material, apply_depthpro_weightcode, spectral_filter_3x3_kernel, tileable_4quad_blend, SUPPORTED_TARGETS, PRESETS, run_graph`
+- `from hypbr import list_materials, synthesize_material, synthesize_all, synthesize_hardops_plate, blend_materials, compute_height_blend_mask, export_material, verify_material, render_preview_html, serve_preview, apply_depthpro_weightcode, spectral_filter_3x3_kernel, tileable_4quad_blend, SUPPORTED_TARGETS, PRESETS, run_graph`
+- `blend_materials(dir_a, dir_b, out_dir, factor=0.5, contrast=0.15, mode="height") -> Path`: Physically blends two seamless material directories using 16-bit height-lerp, cavity, or linear masking with linear-light albedo and recomputed HBAO/bent-normal/curvature/ORM.
 - `verify_material(mat_dir, seam_ratio_limit=2.2) -> dict`: Returns pass/fail report with border-to-interior seam ratios, normal unit-length/+Z/curl metrics, ORM channel diff, and PBR luminance/roughness ranges.
 - `apply_depthpro_weightcode(model, ...)` / `spectral_filter_3x3_kernel(W, dc_gain, ramp_gain, detail_gain)` / `tileable_4quad_blend(rgb, infer_fn)`: Zero-training analytic weight surgery on 3×3 Conv2d kernels and exact 4-quadrant partition-of-unity seamless blending.
 - `export_material(src_dir, out_dir, target, name=None) -> Path`: Converts a synthesized `hypbr` directory to engine-native assets:
@@ -34,8 +37,8 @@
   - `materialx`: MaterialX 1.38 `material.mtlx` (`standard_surface` + `displacement`) + textures.
   - `usd`: OpenUSD ASCII `material.usda` (`UsdPreviewSurface` with normal scale/bias decoding) + textures.
 - `list_materials() -> list[dict[str, str]]`: Returns `{id, description, category}` entries for all built-in procedural materials.
-- `synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, seed: int | None = None) -> Path`: Writes 15 seamless PBR PNGs + `preview.png` to `out_dir`.
-- `synthesize_all(out_dir: Path | str, size: int = 512, materials: list[str] | None = None) -> list[Path]`: Batch-synthesizes all or selected materials.
+- `synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, seed: int | None = None, wear: float = 0.0) -> Path`: Writes 15 seamless PBR PNGs + `preview.png` to `out_dir` with optional weathering `wear in [0.0, 1.0]`.
+- `synthesize_all(out_dir: Path | str, size: int = 512, materials: list[str] | None = None, wear: float = 0.0) -> list[Path]`: Batch-synthesizes all or selected materials.
 - `synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path`: Synthesizes a machined hard-surface gunmetal panel using SDF plugs, bevels, and weld fillets.
 - `PRESETS: dict[str, dict]`: Built-in JSON-serializable PBR node graphs (default: `"v13-default"`).
 
@@ -56,6 +59,8 @@
 ## Core Modules
 
 - [hypbr/weightcode.py](hypbr/weightcode.py): Zero-training analytic 3×3 spectral kernel surgery, SVD energy shrinkage, circular padding, and 4-quadrant tileable blending.
+- [hypbr/blend.py](hypbr/blend.py): 16-bit HeightLerp / cavity physical material blending (`hypbr blend`).
+- [hypbr/preview.py](hypbr/preview.py): Zero-dependency local interactive Three.js PBR studio preview (`hypbr preview`).
 - [hypbr/verify.py](hypbr/verify.py): Automated seamlessness, normal validity, ORM packing, and PBR calibration verifier (`hypbr verify`).
 - [hypbr/exporters.py](hypbr/exporters.py): Engine & standard I/O exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `glb`, `vulkan`, `materialx`, `usd`).
 - [hypbr/cli.py](hypbr/cli.py): Command-line entrypoint (`hypbr`).
