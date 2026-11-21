@@ -1,0 +1,52 @@
+# hypbr
+
+> Hybrid Neural + Exact Periodic Procedural PBR Material Synthesizer that outputs seamlessly tileable, physically calibrated 15-map PBR texture sets (glTF 2.0 ORM, 16-bit height, OpenGL/DirectX tangent normals, 8-azimuth HBAO, bent normals, curvature, anisotropy, specular, and thickness).
+
+## Install
+
+- `pip install -e .` (core procedural synthesis: `numpy`, `pillow`, `torch`)
+- `pip install -e ".[neural]"` (optional photo-to-PBR via ONNX Runtime + Apple Depth Pro)
+
+## CLI Commands
+
+- `hypbr list` — List built-in seamless procedural material IDs and categories.
+- `hypbr synth <material_id|hardops_plate|all> --size 512 --out ./output/pbr [--seed 42]` — Synthesize a complete 15-map seamless PBR material set.
+- `hypbr dump-preset [v13-default]` — Export a built-in composable PBR node graph preset as JSON.
+- `hypbr photo <image> --preset v13-default [--graph custom.json] [--tileable] [--dx] --out ./output/photo_pbr` — Convert a macro photograph into 15 PBR maps using Apple Depth Pro + DeepBump ONNX + the 47-node graph.
+
+## Python API
+
+- `from hypbr import list_materials, synthesize_material, synthesize_all, synthesize_hardops_plate, PRESETS, run_graph`
+- `list_materials() -> list[dict[str, str]]`: Returns `{id, description, category}` entries for all built-in procedural materials.
+- `synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, seed: int | None = None) -> Path`: Writes 15 seamless PBR PNGs + `preview.png` to `out_dir`.
+- `synthesize_all(out_dir: Path | str, size: int = 512, materials: list[str] | None = None) -> list[Path]`: Batch-synthesizes all or selected materials.
+- `synthesize_hardops_plate(out_dir: Path, size: int = 512) -> Path`: Synthesizes a machined hard-surface gunmetal panel using SDF plugs, bevels, and weld fillets.
+- `PRESETS: dict[str, dict]`: Built-in JSON-serializable PBR node graphs (default: `"v13-default"`).
+
+## Output Maps (per material)
+
+- `albedo_delit.png`: 8-bit sRGB de-lit base color
+- `normal.png`: 8-bit RGB tangent-space normal (OpenGL +Y; pass `--dx` in `photo` mode for DirectX -Y)
+- `bent_normal.png`: 8-bit RGB average unoccluded hemisphere direction
+- `height.png`, `height16.png`: 8-bit and 16-bit linear POM/displacement heightmaps
+- `ao.png`: 8-bit 8-azimuth Horizon-Based Ambient Occlusion
+- `roughness.png`: 8-bit roughness with Kaplanyan/Toksvig Specular AA
+- `metallic.png`: 8-bit metallic mask
+- `orm.png`: 8-bit glTF 2.0 packed ORM (`R=AO, G=Roughness, B=Metallic`)
+- `curvature.png`, `cavity.png`, `edge_wear.png`: Multi-scale curvature, crevice, and convex wear masks
+- `anisotropy.png`, `specular.png`, `thickness.png`: Anisotropic tangent flow, F0 specular modulation, subsurface thickness
+- `preview.png`: Shaded studio preview
+
+## Core Modules
+
+- [hypbr/cli.py](hypbr/cli.py): Command-line entrypoint (`hypbr`).
+- [hypbr/synthesize.py](hypbr/synthesize.py): Public Python synthesis API and multi-tone physical albedo/metallic rules.
+- [hypbr/procedural.py](hypbr/procedural.py): Exact periodic FBM, Voronoi, weave, ceramic, wood, and metal heightfield generators.
+- [hypbr/normal_graph.py](hypbr/normal_graph.py): 47-node composable PBR graph engine (RNM blending, Weickert structure tensor, analytic bevels, 8-azimuth HBAO, Specular AA).
+- [hypbr/depthpro_pbr.py](hypbr/depthpro_pbr.py): Optional Apple Depth Pro + DeepBump ONNX neural relief extractor with 4-rotation perspective cancellation.
+
+## Examples & Tests
+
+- [examples/synthesize_pbr.py](examples/synthesize_pbr.py): Synthesize sample 15-map PBR materials via Python API.
+- [examples/custom_graph.py](examples/custom_graph.py): Inspect and export an editable 47-node JSON graph.
+- [tests/test_smoke.py](tests/test_smoke.py): Smoke tests verifying catalog, presets, and 15-map output integrity.
