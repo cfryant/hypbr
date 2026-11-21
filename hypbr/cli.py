@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from . import normal_graph as ng
+from .exporters import SUPPORTED_TARGETS, export_material
 from .synthesize import list_materials, synthesize_all, synthesize_hardops_plate, synthesize_material
 
 
@@ -17,17 +18,46 @@ def cmd_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_targets(raw: str) -> list[str]:
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if "all" in parts:
+        return list(SUPPORTED_TARGETS)
+    for t in parts:
+        if t not in SUPPORTED_TARGETS:
+            raise ValueError(f"Unsupported target '{t}'. Available: {', '.join(SUPPORTED_TARGETS)}, all")
+    return parts
+
+
 def cmd_synth(args: argparse.Namespace) -> int:
     t0 = time.time()
     if args.material == "all":
         paths = synthesize_all(args.out, size=args.size)
         print(f"Synthesized {len(paths)} seamless 15-map PBR sets in {time.time() - t0:.1f}s -> {args.out}")
     elif args.material == "hardops_plate":
-        out = synthesize_hardops_plate(args.out / "hardops_plate", size=args.size)
-        print(f"Synthesized hardops_plate in {time.time() - t0:.2f}s -> {out}")
+        paths = [synthesize_hardops_plate(args.out / "hardops_plate", size=args.size)]
+        print(f"Synthesized hardops_plate in {time.time() - t0:.2f}s -> {paths[0]}")
     else:
-        out = synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed)
-        print(f"Synthesized {args.material} (15 maps, {args.size}x{args.size}) in {time.time() - t0:.2f}s -> {out}")
+        paths = [synthesize_material(args.material, args.out / args.material, size=args.size, seed=args.seed)]
+        print(f"Synthesized {args.material} (15 maps, {args.size}x{args.size}) in {time.time() - t0:.2f}s -> {paths[0]}")
+
+    if args.export:
+        targets = _resolve_targets(args.export)
+        for mat_dir in paths:
+            for tgt in targets:
+                exp_dir = mat_dir / "exports" / tgt
+                export_material(mat_dir, exp_dir, target=tgt, name=mat_dir.name)
+            print(f"  Exported {mat_dir.name} -> {', '.join(targets)} ({mat_dir / 'exports'})")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    targets = _resolve_targets(args.target)
+    src = Path(args.src)
+    mat_name = args.name or src.name
+    for tgt in targets:
+        dst = args.out if (len(targets) == 1 and not args.subdir) else (args.out / tgt)
+        export_material(src, dst, target=tgt, name=mat_name)
+        print(f"Exported [{tgt:10s}] -> {dst}")
     return 0
 
 
@@ -71,7 +101,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_synth.add_argument("--out", type=Path, default=Path("./output/pbr"), help="Output directory")
     p_synth.add_argument("--size", type=int, default=512, help="Square texture resolution (default: 512)")
     p_synth.add_argument("--seed", type=int, default=None, help="Optional deterministic seed override")
+    p_synth.add_argument(
+        "--export",
+        type=str,
+        default=None,
+        help=f"Comma-separated engine export targets ({', '.join(SUPPORTED_TARGETS)}, all)",
+    )
     p_synth.set_defaults(func=cmd_synth)
+
+    p_exp = sub.add_parser("export", help="Export an existing hypbr material directory to game engines & 3D standards")
+    p_exp.add_argument("src", type=Path, help="Source hypbr material directory")
+    p_exp.add_argument(
+        "--target",
+        required=True,
+        help=f"Comma-separated targets: {', '.join(SUPPORTED_TARGETS)}, all",
+    )
+    p_exp.add_argument("--out", type=Path, required=True, help="Destination output directory")
+    p_exp.add_argument("--name", type=str, default=None, help="Optional material name override")
+    p_exp.add_argument("--subdir", action="store_true", help="Always write into <out>/<target>/ even for a single target")
+    p_exp.set_defaults(func=cmd_export)
 
     p_dump = sub.add_parser("dump-preset", help="Dump a built-in 47-node PBR graph preset as JSON")
     p_dump.add_argument("preset", nargs="?", default="v13-default", help="Preset name (default: v13-default)")

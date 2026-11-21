@@ -10,13 +10,24 @@
 ## CLI Commands
 
 - `hypbr list` — List built-in seamless procedural material IDs and categories.
-- `hypbr synth <material_id|hardops_plate|all> --size 512 --out ./output/pbr [--seed 42]` — Synthesize a complete 15-map seamless PBR material set.
+- `hypbr synth <material_id|hardops_plate|all> --size 512 --out ./output/pbr [--seed 42] [--export unity,godot,unreal,blender,threejs,gltf,vulkan,materialx|all]` — Synthesize a complete 15-map seamless PBR material set and optionally export to target engines.
+- `hypbr export <src_dir> --target <unity|unity-hdrp|godot|unreal|blender|threejs|gltf|vulkan|materialx|all> --out <out_dir>` — Export an existing `hypbr` material directory with engine-native channel packing, normal convention, and material definition files.
 - `hypbr dump-preset [v13-default]` — Export a built-in composable PBR node graph preset as JSON.
 - `hypbr photo <image> --preset v13-default [--graph custom.json] [--tileable] [--dx] --out ./output/photo_pbr` — Convert a macro photograph into 15 PBR maps using Apple Depth Pro + DeepBump ONNX + the 47-node graph.
 
 ## Python API
 
-- `from hypbr import list_materials, synthesize_material, synthesize_all, synthesize_hardops_plate, PRESETS, run_graph`
+- `from hypbr import list_materials, synthesize_material, synthesize_all, synthesize_hardops_plate, export_material, SUPPORTED_TARGETS, PRESETS, run_graph`
+- `export_material(src_dir, out_dir, target, name=None) -> Path`: Converts a synthesized `hypbr` directory to engine-native assets:
+  - `unity`: URP `MetallicSmoothness.png` (`R=Metallic, A=1-Roughness`), OpenGL `+Y` normal, `unity_material.json`.
+  - `unity-hdrp`: HDRP `MaskMap.png` (`R=Metallic, G=AO, B=Detail, A=1-Roughness`), OpenGL `+Y` normal.
+  - `godot`: Godot 4 `material.tres` (`StandardMaterial3D` with ORM channels + deep parallax) + textures.
+  - `unreal`: DirectX `-Y` flipped `T_Normal_DX.png` & `T_BentNormal_DX.png`, `T_ORM.png`, `T_Height16.png`, `ue5_material.json`.
+  - `blender`: Blender 4.x `import_blender.py` (Principled BSDF node tree with `sRGB`/`Non-Color` setup) + textures.
+  - `threejs`: ES module `material.js` (`MeshPhysicalMaterial` factory) + textures.
+  - `gltf`: glTF 2.0 `material.gltf` + `baseColor.png`, `orm.png`, `normal.png`.
+  - `vulkan`: `vulkan_manifest.json` (`VK_FORMAT_*` + `ktx create` commands), `orm_unorm.png`, `normal_rg_bc5_src.png`, `height_r16.png`.
+  - `materialx`: MaterialX 1.38 `material.mtlx` (`standard_surface` + `displacement`) + textures.
 - `list_materials() -> list[dict[str, str]]`: Returns `{id, description, category}` entries for all built-in procedural materials.
 - `synthesize_material(material_id: str, out_dir: Path | str, size: int = 512, seed: int | None = None) -> Path`: Writes 15 seamless PBR PNGs + `preview.png` to `out_dir`.
 - `synthesize_all(out_dir: Path | str, size: int = 512, materials: list[str] | None = None) -> list[Path]`: Batch-synthesizes all or selected materials.
@@ -39,6 +50,7 @@
 
 ## Core Modules
 
+- [hypbr/exporters.py](hypbr/exporters.py): Engine & standard I/O exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `vulkan`, `materialx`).
 - [hypbr/cli.py](hypbr/cli.py): Command-line entrypoint (`hypbr`).
 - [hypbr/synthesize.py](hypbr/synthesize.py): Public Python synthesis API and multi-tone physical albedo/metallic rules.
 - [hypbr/procedural.py](hypbr/procedural.py): Exact periodic FBM, Voronoi, weave, ceramic, wood, and metal heightfield generators.

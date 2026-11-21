@@ -46,6 +46,18 @@ Synthesize a single seamless 15-map PBR material at `1024x1024`:
 hypbr synth verdigris_patina_bronze --size 1024 --out ./output/pbr
 ```
 
+Synthesize and export directly to game engines & 3D tools in one command:
+
+```bash
+hypbr synth verdigris_patina_bronze --size 1024 --export unity,godot,unreal,blender,threejs,vulkan --out ./output/pbr
+```
+
+Or export any existing `hypbr` material directory:
+
+```bash
+hypbr export ./output/pbr/verdigris_patina_bronze --target all --out ./output/engines/bronze
+```
+
 Synthesize a machined hard-surface panel (`hardops_plate`):
 
 ```bash
@@ -89,7 +101,21 @@ out_dir = synthesize_material(
 print("Saved 15 PBR maps to:", out_dir)
 ```
 
-### 2. Inspect or Customize the Node Graph
+### 2. Export to Unity, Godot, Unreal, Blender, Three.js, Vulkan & MaterialX
+
+```python
+from hypbr import export_material, synthesize_material
+
+raw = synthesize_material("verdigris_patina_bronze", "./output/bronze", size=1024)
+export_material(raw, "./output/unity/bronze", target="unity")
+export_material(raw, "./output/godot/bronze", target="godot")
+export_material(raw, "./output/unreal/bronze", target="unreal")
+export_material(raw, "./output/threejs/bronze", target="threejs")
+export_material(raw, "./output/blender/bronze", target="blender")
+export_material(raw, "./output/vulkan/bronze", target="vulkan")
+```
+
+### 3. Inspect or Customize the Node Graph
 
 ```python
 import json
@@ -101,7 +127,21 @@ with open("custom_graph.json", "w") as f:
     json.dump(graph, f, indent=2)
 ```
 
-See runnable scripts in [`examples/synthesize_pbr.py`](examples/synthesize_pbr.py) and [`examples/custom_graph.py`](examples/custom_graph.py).
+See runnable scripts in [`examples/synthesize_pbr.py`](examples/synthesize_pbr.py), [`examples/export_engines.py`](examples/export_engines.py), and [`examples/custom_graph.py`](examples/custom_graph.py).
+
+## Engine & Standard I/O Targets
+
+| Target | Normal Convention | Channel Packing & Ready-to-Import Assets |
+|---|---|---|
+| `unity` | OpenGL `+Y` | `BaseMap.png`, `NormalMap.png`, `MetallicSmoothness.png` (`R=Metallic, A=1-Roughness`), `OcclusionMap.png`, `HeightMap.png`, `unity_material.json` |
+| `unity-hdrp` | OpenGL `+Y` | `BaseMap.png`, `NormalMap.png`, `MaskMap.png` (`R=Metallic, G=AO, B=Detail, A=1-Roughness`), `HeightMap.png`, `unity_material.json` |
+| `godot` | OpenGL `+Y` | Godot 4 `material.tres` (`StandardMaterial3D` with deep parallax & ORM channels), `albedo.png`, `orm.png`, `normal.png`, `height.png` |
+| `unreal` | DirectX `-Y` | `T_BaseColor.png`, `T_Normal_DX.png` (green-flipped), `T_BentNormal_DX.png`, `T_ORM.png`, `T_Height16.png`, `ue5_material.json` |
+| `blender` | OpenGL `+Y` | `import_blender.py` (one-click Blender 4.x Principled BSDF node tree with `sRGB`/`Non-Color` setup) + textures |
+| `threejs` | OpenGL `+Y` | `material.js` ES module (`MeshPhysicalMaterial` factory with `SRGBColorSpace` / `NoColorSpace` & anisotropy) + textures |
+| `gltf` | OpenGL `+Y` | `material.gltf` (glTF 2.0 `pbrMetallicRoughness` + `occlusionTexture` + `normalTexture`), `baseColor.png`, `orm.png`, `normal.png` |
+| `vulkan` | OpenGL `+Y` | `vulkan_manifest.json` (`VK_FORMAT_*` bindings & `ktx create` UASTC/BC5 commands), `orm_unorm.png`, `normal_rg_bc5_src.png`, `height_r16.png` |
+| `materialx` | OpenGL `+Y` | `material.mtlx` (MaterialX 1.38 `standard_surface` + `displacement` for OpenUSD, Houdini, Maya, RealityKit) + textures |
 
 ## Output Maps
 
@@ -132,6 +172,7 @@ Every material synthesis writes a clean, renderer-ready directory compatible wit
 - [`hypbr/normal_graph.py`](hypbr/normal_graph.py): Composable 47-node PBR graph engine (RNM blending, Weickert structure tensors, analytic SDF bevels, 8-azimuth HBAO + bent normals, Toksvig Specular AA, ORM packing).
 - [`hypbr/synthesize.py`](hypbr/synthesize.py): High-level material synthesis API combining periodic heightfields, physically based multi-tone albedo/metallic rules, and the 15-map export pipeline.
 - [`hypbr/depthpro_pbr.py`](hypbr/depthpro_pbr.py): Optional Apple Depth Pro + DeepBump ONNX neural depth/normal extraction with 4-rotation perspective cancellation and circular padding.
+- [`hypbr/exporters.py`](hypbr/exporters.py): Zero-dependency engine & standard exporters (`unity`, `unity-hdrp`, `godot`, `unreal`, `blender`, `threejs`, `gltf`, `vulkan`, `materialx`).
 - [`hypbr/cli.py`](hypbr/cli.py): `hypbr` command-line interface.
 
 ## License
