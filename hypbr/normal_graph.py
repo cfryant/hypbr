@@ -2032,6 +2032,7 @@ def main():
     ap.add_argument("--tileable", action="store_true")
     ap.add_argument("--dx", action="store_true", help="DirectX -Y normal output (default OpenGL +Y)")
     ap.add_argument("--transparency", choices=("auto", "on", "off"), default="auto", help="Opacity/cutout emission mode")
+    ap.add_argument("--emissive", choices=("auto", "on", "off"), default="auto", help="Emissive map emission mode")
     ap.add_argument("--strength", type=float, default=1.0, help="Final normal strength multiplier")
     args = ap.parse_args()
 
@@ -2109,6 +2110,17 @@ def main():
             Image.fromarray(op_u8).save(sub / "opacity.png")
         elif (sub / "opacity.png").exists():
             (sub / "opacity.png").unlink()
+        e_mode = getattr(args, "emissive", "auto")
+        if e_mode != "off" and "emissive" in outs:
+            em_u8 = get_out(state, outs["emissive"])
+        else:
+            em_u8 = np.zeros((args.size, args.size, 3), np.uint8)
+        em_lin_chk = np.power(em_u8.astype(np.float32) / 255.0, 2.2)
+        meaningful_em = float((np.max(em_lin_chk, axis=-1) > 0.03).mean()) > 0.001
+        if e_mode == "on" or (e_mode == "auto" and meaningful_em):
+            Image.fromarray(em_u8).save(sub / "emissive.png")
+        elif (sub / "emissive.png").exists():
+            (sub / "emissive.png").unlink()
         try:
             from .synthesize import render_studio_preview
             alb_lin = np.power(np.clip(albedo_u8.astype(np.float32) / 255.0, 0.0, 1.0), 2.2)

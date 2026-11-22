@@ -164,6 +164,26 @@ def verify_material(mat_dir: Path | str, seam_ratio_limit: float = 2.2) -> dict[
             "opacity_mean": round(float(op_arr.mean() / 255.0), 3),
         }
 
+    # 6. Optional 17th map: emissive.png (sRGB color glow)
+    em_path = d / "emissive.png"
+    if em_path.exists():
+        with Image.open(em_path) as em_im:
+            if em_im.size != resolution:
+                errors.append(f"emissive.png resolution {em_im.size} != {resolution}")
+            em_arr = np.asarray(em_im.convert("RGB"), dtype=np.uint8)
+        seam_em = _seam_metrics(em_arr)
+        checks["seamless"]["emissive"] = seam_em
+        if seam_em["border_l1"] > 0.03 and seam_em["seam_ratio"] > seam_ratio_limit:
+            errors.append(f"emissive wrap seam detected (ratio={seam_em['seam_ratio']}, border_l1={seam_em['border_l1']})")
+        em_lin = np.power(em_arr.astype(np.float32) / 255.0, 2.2)
+        em_peak = np.max(em_lin, axis=-1)
+        checks["emissive"] = {
+            "has_emissive": bool(float((em_peak > 0.03).mean()) > 0.001),
+            "glow_fraction": round(float((em_peak > 0.03).mean()), 4),
+            "emissive_max": round(float(em_arr.max() / 255.0), 3),
+            "emissive_mean": round(float(em_arr.mean() / 255.0), 3),
+        }
+
     return {
         "material": d.name,
         "passed": len(errors) == 0,

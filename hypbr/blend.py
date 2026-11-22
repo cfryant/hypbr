@@ -17,7 +17,7 @@ from PIL import Image
 from . import depthpro_pbr as dp
 from . import normal_graph as ng
 from . import procedural as gd
-from .synthesize import has_meaningful_cutout, normalize_transparency_mode, render_studio_preview, save_maps_parallel
+from .synthesize import has_meaningful_cutout, has_meaningful_emissive, normalize_emissive_mode, normalize_transparency_mode, render_studio_preview, save_maps_parallel
 
 
 def _load_srgb_linear(path: Path, size: tuple[int, int]) -> np.ndarray:
@@ -121,6 +121,7 @@ def blend_materials(
     contrast: float = 0.06,
     mode: str = "height",
     transparency: str = "auto",
+    emissive: str = "auto",
 ) -> Path:
     """Physically blend two hypbr material directories into a new seamless 15-map directory."""
     pa, pb, out = Path(dir_a), Path(dir_b), Path(out_dir)
@@ -221,7 +222,27 @@ def blend_materials(
     meaningful_op = has_meaningful_cutout(op_f)
     write_opacity = (t_mode == "on") or (t_mode == "auto" and src_has_op and src_meaningful and meaningful_op)
     op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    prev_u8 = render_studio_preview(alb_lin, n_out, rough, met, ao, opacity=(op_f if write_opacity and meaningful_op else None))
+    e_mode = normalize_emissive_mode(emissive)
+    src_has_em = (pa / "emissive.png").exists() or (pb / "emissive.png").exists()
+    em_a = _load_srgb_linear(pa / "emissive.png", size) if (pa / "emissive.png").exists() else np.zeros((size[1], size[0], 3), dtype=np.float32)
+    em_b = _load_srgb_linear(pb / "emissive.png", size) if (pb / "emissive.png").exists() else np.zeros((size[1], size[0], 3), dtype=np.float32)
+    src_em_meaningful = ((pa / "emissive.png").exists() and has_meaningful_emissive(em_a)) or ((pb / "emissive.png").exists() and has_meaningful_emissive(em_b))
+    em_lin = np.clip((1.0 - m3) * em_a + m3 * em_b, 0.0, 1.0).astype(np.float32) if e_mode != "off" else np.zeros((size[1], size[0], 3), dtype=np.float32)
+    meaningful_em = has_meaningful_emissive(em_lin)
+    write_emissive = (e_mode == "on") or (e_mode == "auto" and src_has_em and src_em_meaningful and meaningful_em)
+    em_u8 = np.clip(np.power(np.clip(em_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    prev_u8 = render_studio_preview(
+        alb_lin, n_out, rough, met, ao,
+        opacity=(op_f if write_opacity and meaningful_op else None),
+        emissive=(em_lin if write_emissive and meaningful_em else None),
+    )
+
+    extra_maps = []
+    if write_opacity:
+        extra_maps.append((out / "opacity.png", op_u8))
+    if write_emissive:
+        extra_maps.append((out / "emissive.png", em_u8))
 
     save_maps_parallel([
         (out / "albedo_delit.png", alb_u8),
@@ -241,7 +262,9 @@ def blend_materials(
         (out / "specular.png", aniso["specular_u8"]),
         (out / "thickness.png", thick["thickness_u8"]),
         (out / "blend_mask.png", np.clip(surf_mask * 255.0 + 0.5, 0, 255).astype(np.uint8)),
-    ] + ([(out / "opacity.png", op_u8)] if write_opacity else []))
+    ] + extra_maps)
     if not write_opacity and (out / "opacity.png").exists():
         (out / "opacity.png").unlink()
+    if not write_emissive and (out / "emissive.png").exists():
+        (out / "emissive.png").unlink()
     return out

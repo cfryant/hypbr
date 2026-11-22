@@ -258,11 +258,299 @@ DAILY_CATALOG = [
     ("travertine_porous_stone",  "Honed Roman travertine limestone with banded horizontal erosion pores",  "stone",   (0.76, 0.69, 0.58)),
     ("gilded_tin_ceiling_tile",  "Embossed vintage pressed-tin ceiling relief in antique champagne brass", "brass",   (0.74, 0.60, 0.34)),
     ("chainlink_fence_galvanized","Woven diamond galvanized steel chain-link fence with over-under crossings, light rust & transparent holes", "metal", (0.58, 0.61, 0.64)),
+    ("cooling_lava_cracks",      "Volcanic cooling basalt plates fractured by incandescent molten magma fissures", "stone",   (0.10, 0.08, 0.07)),
+    ("scifi_panel_emissive",     "Brushed titanium-gunmetal sci-fi bulkhead panels with glowing cyan & amber LED strips", "metal",   (0.32, 0.36, 0.42)),
+    ("circuit_board_glow",       "Dark solder-mask PCB with gold ENIG pads and energized emerald-cyan glowing traces", "metal",   (0.06, 0.14, 0.10)),
+    ("glowing_charcoal_embers",  "Fractured charred wood-charcoal chunks with flaky ash ridges and smoldering orange-red embers", "stone", (0.08, 0.07, 0.07)),
+    ("carved_runic_stone",       "Weathered dark slate temple blocks engraved with glowing violet-cyan arcane runes", "stone", (0.14, 0.16, 0.20)),
+    ("neon_brick_wall",          "Running-bond weathered urban masonry brick wall with glowing magenta & cyan neon glass tubes", "stone", (0.36, 0.16, 0.12)),
 ]
 
 TRANSPARENT_MATERIALS = frozenset({"chainlink_fence_galvanized"})
+EMISSIVE_MATERIALS = frozenset({
+    "cooling_lava_cracks",
+    "scifi_panel_emissive",
+    "circuit_board_glow",
+    "glowing_charcoal_embers",
+    "carved_runic_stone",
+    "neon_brick_wall",
+})
 
 WEAR_STATES = ("0_fresh", "1_lived_in", "2_weathered")
+
+
+
+
+def _emissive_geom(detail_id: str, H: int, W: int, seed: int) -> dict[str, np.ndarray]:
+    """Compute deterministic periodic geometry & mask fields shared by height/albedo/emissive maps."""
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    u = xx / float(W)
+    v = yy / float(H)
+
+    if detail_id == "cooling_lava_cracks":
+        wx = _periodic_fbm(H, W, seed + 1, (3, 6, 12))
+        wy = _periodic_fbm(H, W, seed + 2, (3, 6, 12))
+        wu = (u + 0.055 * wx) % 1.0
+        wv = (v + 0.055 * wy) % 1.0
+        f1a, f2a = _periodic_worley(wu, wv, 5, seed + 3)
+        f1b, f2b = _periodic_worley((u + 0.03 * wy) % 1.0, (v - 0.03 * wx) % 1.0, 10, seed + 4)
+        da = f2a - f1a
+        db = f2b - f1b
+        crack_a = 1.0 - _smoothstep(0.018, 0.095, da)
+        crack_b = (1.0 - _smoothstep(0.012, 0.068, db)) * 0.72
+        cracks = np.maximum(crack_a, crack_b)
+        vesicles = _smoothstep(0.55, 1.15, -_periodic_fbm(H, W, seed + 5, (24, 48, 96))) * 0.14
+        crust_bump = 0.08 * _periodic_fbm(H, W, seed + 6, (8, 16, 32))
+        # Crust plates sit high, fissures plunge deep
+        plate = (1.0 - cracks) * (0.76 + crust_bump - vesicles * (1.0 - cracks)) + cracks * 0.08
+        heat_var = np.clip(0.55 + 0.45 * _periodic_fbm(H, W, seed + 7, (4, 8, 16)), 0.0, 1.0)
+        glow_core = (1.0 - _smoothstep(0.008, 0.048, da)) * (0.78 + 0.22 * heat_var)
+        glow_sec = (1.0 - _smoothstep(0.006, 0.034, db)) * 0.68 * heat_var
+        glow_halo = np.clip(np.maximum(1.0 - _smoothstep(0.025, 0.115, da), (1.0 - _smoothstep(0.018, 0.075, db)) * 0.55) * (0.65 + 0.35 * heat_var), 0.0, 1.0)
+        glow = np.clip(np.maximum(glow_core, glow_sec), 0.0, 1.0)
+        cav = np.clip(cracks * 1.05 + vesicles * 0.6, 0.0, 1.0)
+        ridge = _smoothstep(0.08, 0.16, da) * (1.0 - _smoothstep(0.16, 0.28, da))
+        return {
+            "h": plate.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "glow": glow.astype(np.float32), "glow_halo": glow_halo.astype(np.float32), "heat_var": heat_var.astype(np.float32),
+        }
+
+    if detail_id == "scifi_panel_emissive":
+        n = 2.0
+        fu = ((u + 0.175) * n) % 1.0
+        fv = ((v + 0.25) * n) % 1.0
+        du = np.minimum(fu, 1.0 - fu)
+        dv = np.minimum(fv, 1.0 - fv)
+        d_seam = np.minimum(du, dv)
+        # Stepped armor plates + secondary sub-panel seam
+        outer_seam = 1.0 - _smoothstep(0.012, 0.026, d_seam)
+        sub_d = np.abs(fu - 0.50)
+        sub_seam = (1.0 - _smoothstep(0.008, 0.018, sub_d)) * _smoothstep(0.08, 0.12, dv)
+        # Beveled recessed light bay on left plate (fu in 0.14..0.21, fv in 0.18..0.82)
+        cx1, cy1 = np.abs(fu - 0.185), np.abs(fv - 0.50)
+        bay1 = (1.0 - _smoothstep(0.028, 0.042, cx1)) * (1.0 - _smoothstep(0.28, 0.32, cy1))
+        strip_cyan1 = (1.0 - _smoothstep(0.011, 0.021, cx1)) * (1.0 - _smoothstep(0.25, 0.28, cy1))
+        # Horizontal telemetry bar on right plate
+        cx2, cy2 = np.abs(fu - 0.72), np.abs(fv - 0.24)
+        bay2 = (1.0 - _smoothstep(0.14, 0.16, cx2)) * (1.0 - _smoothstep(0.024, 0.036, cy2))
+        strip_cyan2 = (1.0 - _smoothstep(0.12, 0.14, cx2)) * (1.0 - _smoothstep(0.010, 0.018, cy2))
+        # Amber status pips (3 small bars)
+        pip = np.zeros_like(u)
+        for py in (0.64, 0.71, 0.78):
+            pip = np.maximum(pip, (1.0 - _smoothstep(0.038, 0.048, np.abs(fu - 0.78))) * (1.0 - _smoothstep(0.009, 0.016, np.abs(fv - py))))
+        # Corner hex bolts
+        bolt = np.zeros_like(u)
+        for bx, by in ((0.08, 0.08), (0.92, 0.08), (0.08, 0.92), (0.92, 0.92), (0.42, 0.08), (0.58, 0.92)):
+            dr = np.sqrt((fu - bx) ** 2 + (fv - by) ** 2)
+            bolt = np.maximum(bolt, (1.0 - _smoothstep(0.018, 0.025, dr)) * 0.7 + _smoothstep(0.025, 0.031, dr) * (1.0 - _smoothstep(0.031, 0.038, dr)) * -0.4)
+        # Cooling louvers on lower-right
+        louv = (1.0 - _smoothstep(0.10, 0.12, np.abs(fu - 0.68))) * (1.0 - _smoothstep(0.07, 0.09, np.abs(fv - 0.45))) * _smoothstep(0.2, 0.7, np.sin(2.0 * math.pi * fv * 48.0))
+        brush = 0.014 * _periodic_fbm(H, W, seed + 11, (4, 64))
+        seams = np.maximum(outer_seam, sub_seam * 0.75)
+        bays = np.maximum(bay1, bay2)
+        cyan = np.clip(np.maximum(strip_cyan1, strip_cyan2), 0.0, 1.0)
+        amber = np.clip(pip, 0.0, 1.0)
+        h = 0.74 - 0.34 * seams - 0.20 * bays + 0.09 * cyan + 0.06 * amber + 0.10 * bolt - 0.14 * louv + brush
+        cav = np.clip(np.maximum(seams, np.maximum(bays * 0.65, louv * 0.8)), 0.0, 1.0)
+        ridge = np.clip(_smoothstep(0.022, 0.038, d_seam) * (1.0 - _smoothstep(0.038, 0.058, d_seam)) + np.maximum(bolt, 0.0), 0.0, 1.0)
+        return {
+            "h": h.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "cyan": cyan.astype(np.float32), "amber": amber.astype(np.float32), "bays": bays.astype(np.float32),
+        }
+
+    if detail_id == "circuit_board_glow":
+        # 4x4 periodic PCB bus cells with horizontal, vertical & 45-deg traces + ENIG via pads + glowing trace bus
+        n = 4.0
+        fu = (u * n) % 1.0
+        fv = (v * n) % 1.0
+        # Periodic orthogonal + 45-deg routing lanes across tile boundaries
+        tr_h1 = 1.0 - _smoothstep(0.018, 0.030, np.abs(fv - 0.22))
+        tr_h2 = 1.0 - _smoothstep(0.018, 0.030, np.abs(fv - 0.78))
+        tr_v1 = 1.0 - _smoothstep(0.018, 0.030, np.abs(fu - 0.22))
+        tr_v2 = 1.0 - _smoothstep(0.018, 0.030, np.abs(fu - 0.78))
+        # Diagonal connecting bus (periodic because u+v wraps integer N=4)
+        d_diag = np.abs(((u + v) * n) % 1.0 - 0.5)
+        tr_diag = 1.0 - _smoothstep(0.016, 0.028, d_diag)
+        # Fine parallel signal traces
+        fine_bus = (1.0 - _smoothstep(0.010, 0.018, np.abs(fv - 0.44))) + (1.0 - _smoothstep(0.010, 0.018, np.abs(fv - 0.56)))
+        fine_bus = np.clip(fine_bus, 0.0, 1.0)
+        # IC pads / vias
+        pads = np.zeros_like(u)
+        glow_nodes = np.zeros_like(u)
+        for px, py, gnode in ((0.22, 0.22, True), (0.78, 0.78, True), (0.22, 0.78, False), (0.78, 0.22, False), (0.50, 0.50, True)):
+            dr = np.sqrt((fu - px) ** 2 + (fv - py) ** 2)
+            ring = (1.0 - _smoothstep(0.055, 0.072, dr)) * _smoothstep(0.018, 0.028, dr)
+            pads = np.maximum(pads, ring)
+            if gnode:
+                glow_nodes = np.maximum(glow_nodes, 1.0 - _smoothstep(0.018, 0.034, dr))
+        # Energized glowing traces (diagonal bus + h1/v1) vs passive copper traces
+        glow_traces = np.clip(np.maximum(tr_diag, np.maximum(tr_h1 * 0.85, tr_v1 * 0.85)), 0.0, 1.0)
+        passive_traces = np.clip(np.maximum(np.maximum(tr_h2, tr_v2), fine_bus * 0.85) * (1.0 - glow_traces), 0.0, 1.0)
+        all_traces = np.clip(np.maximum(glow_traces, passive_traces), 0.0, 1.0)
+        weave = 0.022 * (np.sin(2.0 * math.pi * u * 64.0) * np.sin(2.0 * math.pi * v * 64.0))
+        h = 0.28 + 0.34 * all_traces + 0.48 * pads + weave * (1.0 - 0.6 * all_traces)
+        cav = _smoothstep(0.32, 0.24, h)
+        ridge = np.clip(np.maximum(all_traces * 0.75, pads), 0.0, 1.0)
+        return {
+            "h": h.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "glow_traces": glow_traces.astype(np.float32), "glow_nodes": glow_nodes.astype(np.float32),
+            "pads": pads.astype(np.float32), "passive_traces": passive_traces.astype(np.float32),
+        }
+
+    if detail_id == "glowing_charcoal_embers":
+        wx = _periodic_fbm(H, W, seed + 21, (4, 8, 16))
+        wy = _periodic_fbm(H, W, seed + 22, (4, 8, 16))
+        f1, f2 = _periodic_worley((u + 0.04 * wx) % 1.0, (v + 0.04 * wy) % 1.0, 7, seed + 23)
+        gap = f2 - f1
+        grain = _periodic_fbm(H, W, seed + 24, (16, 48, 96))
+        char_chunk = _smoothstep(0.015, 0.14, gap)
+        # Wood-char striations inside chunks
+        wood_lines = 0.06 * np.sin(2.0 * math.pi * (u * 28.0 + 0.35 * wx + 0.25 * wy))
+        h = 0.10 + 0.72 * char_chunk + (0.09 * grain + wood_lines) * char_chunk
+        heat = np.clip(0.55 + 0.45 * _periodic_fbm(H, W, seed + 25, (3, 6, 12)), 0.0, 1.0)
+        # Embers glow deep inside fissures & hot pockets along chunk rims
+        ember_core = (1.0 - _smoothstep(0.008, 0.055, gap)) * (0.55 + 0.45 * heat)
+        ember_pocket = _smoothstep(0.62, 0.88, heat) * (1.0 - _smoothstep(0.025, 0.105, gap)) * 0.65
+        glow = np.clip(np.maximum(ember_core, ember_pocket), 0.0, 1.0)
+        ash = np.clip(_smoothstep(0.55, 0.85, char_chunk) * _smoothstep(0.25, 0.75, grain + 0.5) * (1.0 - glow), 0.0, 1.0)
+        cav = np.clip(1.0 - char_chunk, 0.0, 1.0)
+        ridge = np.clip(_smoothstep(0.68, 0.90, h), 0.0, 1.0)
+        return {
+            "h": h.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "glow": glow.astype(np.float32), "ash": ash.astype(np.float32), "heat": heat.astype(np.float32),
+        }
+
+    if detail_id == "carved_runic_stone":
+        # 2x2 dark slate temple slabs with carved geometric arcane sigil grooves
+        n = 2.0
+        fu = ((u + 0.25) * n) % 1.0 - 0.5
+        fv = ((v + 0.25) * n) % 1.0 - 0.5
+        ax, ay = np.abs(fu), np.abs(fv)
+        d_border = np.minimum(0.5 - ax, 0.5 - ay)
+        mortar = 1.0 - _smoothstep(0.010, 0.024, d_border)
+        r = np.sqrt(fu * fu + fv * fv)
+        ang = np.arctan2(fv, fu)
+        # Outer rune circle + inner diamond + cross-staff + radial ticks
+        ring_out = 1.0 - _smoothstep(0.010, 0.022, np.abs(r - 0.31))
+        ring_in = 1.0 - _smoothstep(0.009, 0.020, np.abs(r - 0.14))
+        diamond = 1.0 - _smoothstep(0.010, 0.022, np.abs((ax + ay) - 0.28))
+        axis_v = (1.0 - _smoothstep(0.009, 0.020, ax)) * (1.0 - _smoothstep(0.32, 0.35, ay))
+        axis_h = (1.0 - _smoothstep(0.009, 0.020, ay)) * (1.0 - _smoothstep(0.22, 0.25, ax))
+        # Corner glyph bars
+        corner_bar = (1.0 - _smoothstep(0.008, 0.018, np.abs(ax - 0.38))) * (1.0 - _smoothstep(0.035, 0.050, np.abs(ay - 0.38)))
+        ticks = (1.0 - _smoothstep(0.025, 0.040, np.abs(r - 0.225))) * _smoothstep(0.75, 0.92, np.cos(8.0 * ang))
+        rune = np.clip(np.maximum.reduce([ring_out, ring_in, diamond, axis_v, axis_h, corner_bar, ticks]), 0.0, 1.0)
+        slate = _periodic_fbm(H, W, seed + 31, (6, 18, 48))
+        micro = _periodic_fbm(H, W, seed + 32, (24, 64))
+        h = 0.78 - 0.36 * mortar - 0.30 * rune + 0.055 * slate + 0.022 * micro * (1.0 - rune)
+        cav = np.clip(np.maximum(mortar, rune * 0.92), 0.0, 1.0)
+        ridge = np.clip(_smoothstep(0.020, 0.034, d_border) * (1.0 - _smoothstep(0.034, 0.050, d_border)), 0.0, 1.0)
+        pulse = np.clip(0.72 + 0.28 * np.sin(2.0 * math.pi * (r * 3.0 + 0.15 * slate)), 0.0, 1.0)
+        return {
+            "h": h.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "rune": rune.astype(np.float32), "mortar": mortar.astype(np.float32), "pulse": pulse.astype(np.float32),
+        }
+
+    if detail_id == "neon_brick_wall":
+        # 6 rows x 3 cols periodic running-bond weathered masonry + mounted glowing neon glass tubes
+        rows, cols = 6.0, 3.0
+        vs = (v + 0.5 / rows) % 1.0
+        row_i = np.floor(vs * rows)
+        u_s = (u + 0.5 / cols + 0.5 * (row_i % 2.0) / cols) % 1.0
+        fu = (u_s * cols) % 1.0
+        fv = (vs * rows) % 1.0
+        du = np.minimum(fu, 1.0 - fu) / cols
+        dv = np.minimum(fv, 1.0 - fv) / rows
+        d_edge = np.minimum(du, dv)
+        brick_noise = _periodic_fbm(H, W, seed + 41, (8, 24, 64))
+        brick_id = np.sin((np.floor(u_s * cols) % cols) * 19.1 + (row_i % rows) * 37.3) * 0.5 + 0.5
+        mortar_mask = 1.0 - _smoothstep(0.008, 0.020, d_edge + 0.004 * brick_noise)
+        brick_face = _smoothstep(0.010, 0.026, d_edge)
+        # Neon sign tubes: continuous periodic sine-wave magenta tube + cyan horizontal underline bar
+        y_wave = 0.42 + 0.14 * np.sin(2.0 * math.pi * u * 2.0)
+        d_wave = np.abs(v - y_wave)
+        tube_mag = 1.0 - _smoothstep(0.016, 0.026, d_wave)
+        core_mag = 1.0 - _smoothstep(0.004, 0.014, d_wave)
+        # Cyan ring accents at x=0.25 and x=0.75 (periodic for 2-cycle wave)
+        fx2 = (u * 2.0) % 1.0 - 0.5
+        fy2 = v - 0.72
+        d_bar = np.maximum(np.abs(fy2) - 0.002, np.maximum(np.abs(fx2) - 0.30, 0.0))
+        d_cyan = np.sqrt((np.abs(fx2) - np.clip(np.abs(fx2), 0.0, 0.30)) ** 2 + fy2 ** 2)
+        tube_cyn = 1.0 - _smoothstep(0.015, 0.025, d_cyan)
+        core_cyn = 1.0 - _smoothstep(0.004, 0.013, d_cyan)
+        tubes = np.maximum(tube_mag, tube_cyn)
+        # Wall height + raised cylindrical glass tube profile
+        tube_prof = np.sqrt(np.clip(1.0 - (np.minimum(d_wave, d_cyan) / 0.026) ** 2, 0.0, 1.0)) * tubes
+        wall_h = 0.18 + 0.42 * brick_face + 0.055 * brick_noise * brick_face
+        h = np.maximum(wall_h, 0.64 + 0.34 * tube_prof)
+        cav = np.clip(mortar_mask * (1.0 - tubes), 0.0, 1.0)
+        ridge = np.clip(np.maximum(tubes, _smoothstep(0.022, 0.036, d_edge) * (1.0 - _smoothstep(0.036, 0.055, d_edge))), 0.0, 1.0)
+        return {
+            "h": h.astype(np.float32), "cav": cav.astype(np.float32), "ridge": ridge.astype(np.float32),
+            "brick_id": brick_id.astype(np.float32), "mortar": mortar_mask.astype(np.float32),
+            "tube_mag": tube_mag.astype(np.float32), "core_mag": core_mag.astype(np.float32),
+            "tube_cyn": tube_cyn.astype(np.float32), "core_cyn": core_cyn.astype(np.float32),
+            "tubes": tubes.astype(np.float32),
+        }
+
+    raise KeyError(detail_id)
+
+
+def build_emissive_map(detail_id: str, H: int, W: int, seed: int) -> np.ndarray:
+    """Return linear RGB float32 emissive map in [0, 1] for EMISSIVE_MATERIALS (zeros otherwise)."""
+    if detail_id not in EMISSIVE_MATERIALS:
+        return np.zeros((H, W, 3), dtype=np.float32)
+
+    g = _emissive_geom(detail_id, H, W, seed)
+    if detail_id == "cooling_lava_cracks":
+        glow = g["glow"]
+        halo = g["glow_halo"]
+        c_hot = np.array([1.00, 0.86, 0.30], np.float32)[None, None, :]
+        c_mid = np.array([1.00, 0.28, 0.02], np.float32)[None, None, :]
+        c_dim = np.array([0.52, 0.035, 0.00], np.float32)[None, None, :]
+        hot_w = np.clip((glow - 0.55) / 0.45, 0.0, 1.0)[..., None]
+        core_col = c_mid * (1.0 - hot_w) + c_hot * hot_w
+        em = c_dim * np.clip(halo - glow, 0.0, 1.0)[..., None] + core_col * glow[..., None]
+        return np.clip(em, 0.0, 1.0).astype(np.float32)
+
+    if detail_id == "scifi_panel_emissive":
+        c_cyan = np.array([0.12, 0.86, 1.00], np.float32)[None, None, :]
+        c_amb = np.array([1.00, 0.46, 0.06], np.float32)[None, None, :]
+        em = c_cyan * g["cyan"][..., None] + c_amb * g["amber"][..., None]
+        return np.clip(em, 0.0, 1.0).astype(np.float32)
+
+    if detail_id == "circuit_board_glow":
+        c_trace = np.array([0.08, 0.94, 0.56], np.float32)[None, None, :]
+        c_node = np.array([0.36, 0.96, 1.00], np.float32)[None, None, :]
+        em = c_trace * g["glow_traces"][..., None] + c_node * g["glow_nodes"][..., None]
+        return np.clip(em, 0.0, 1.0).astype(np.float32)
+
+    if detail_id == "glowing_charcoal_embers":
+        glow = g["glow"]
+        c_hot = np.array([1.00, 0.66, 0.10], np.float32)[None, None, :]
+        c_red = np.array([0.92, 0.14, 0.01], np.float32)[None, None, :]
+        hot_w = np.clip((glow - 0.40) / 0.60, 0.0, 1.0)[..., None]
+        col = c_red * (1.0 - hot_w) + c_hot * hot_w
+        return np.clip(col * glow[..., None], 0.0, 1.0).astype(np.float32)
+
+    if detail_id == "carved_runic_stone":
+        rune = g["rune"] * g["pulse"]
+        c_outer = np.array([0.38, 0.32, 1.00], np.float32)[None, None, :]
+        c_core = np.array([0.52, 0.92, 1.00], np.float32)[None, None, :]
+        core_w = np.clip((g["rune"] - 0.45) / 0.55, 0.0, 1.0)[..., None]
+        col = c_outer * (1.0 - core_w) + c_core * core_w
+        return np.clip(col * rune[..., None], 0.0, 1.0).astype(np.float32)
+
+    if detail_id == "neon_brick_wall":
+        c_mag = np.array([1.00, 0.08, 0.58], np.float32)[None, None, :]
+        c_mag_hot = np.array([1.00, 0.72, 0.92], np.float32)[None, None, :]
+        c_cyn = np.array([0.06, 0.88, 1.00], np.float32)[None, None, :]
+        c_cyn_hot = np.array([0.74, 0.98, 1.00], np.float32)[None, None, :]
+        em_m = c_mag * g["tube_mag"][..., None] + (c_mag_hot - c_mag) * g["core_mag"][..., None] * 0.75
+        em_c = c_cyn * g["tube_cyn"][..., None] + (c_cyn_hot - c_cyn) * g["core_cyn"][..., None] * 0.75
+        return np.clip(em_m + em_c, 0.0, 1.0).astype(np.float32)
+
+    return np.zeros((H, W, 3), dtype=np.float32)
 
 
 def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
@@ -270,6 +558,26 @@ def build_daily_detail(detail_id: str, H: int, W: int, seed: int):
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
     u = xx / float(W)
     v = yy / float(H)
+
+    if detail_id in EMISSIVE_MATERIALS:
+        g = _emissive_geom(detail_id, H, W, seed)
+        slope_map = {
+            "cooling_lava_cracks": 18.0,
+            "scifi_panel_emissive": 17.0,
+            "circuit_board_glow": 12.0,
+            "glowing_charcoal_embers": 19.0,
+            "carved_runic_stone": 16.0,
+            "neon_brick_wall": 17.5,
+        }
+        rough_map = {
+            "cooling_lava_cracks": 0.82,
+            "scifi_panel_emissive": 0.30,
+            "circuit_board_glow": 0.46,
+            "glowing_charcoal_embers": 0.86,
+            "carved_runic_stone": 0.72,
+            "neon_brick_wall": 0.78,
+        }
+        return g["h"], slope_map[detail_id], g["cav"], rough_map[detail_id], g["ridge"]
 
     if detail_id == "corrugated_cardboard":
         # 24 vertical flutes + subtle horizontal paper-liner fibers + occasional slight crush wave

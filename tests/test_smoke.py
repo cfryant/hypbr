@@ -145,3 +145,57 @@ def test_transparency_modes_auto_on_off(tmp_path: Path) -> None:
     assert (bl_fence / "opacity.png").exists()
     bl_fence_off = blend_materials(fence_auto, br_auto, tmp_path / "bl_fence_off", factor=0.3, transparency="off")
     assert not (bl_fence_off / "opacity.png").exists()
+
+
+
+def test_emissive_modes_auto_on_off_and_no_opacity(tmp_path: Path) -> None:
+    import json
+    import numpy as np
+    from hypbr import blend_materials, export_material
+    from hypbr import procedural as gd
+
+    # 1. All 6 new emissive materials emit emissive.png in auto mode and NEVER emit opacity.png
+    for mid in gd.EMISSIVE_MATERIALS:
+        d = synthesize_material(mid, tmp_path / f"em_{mid}", size=128, emissive="auto", transparency="auto")
+        assert (d / "emissive.png").exists(), f"{mid} missing emissive.png"
+        assert not (d / "opacity.png").exists(), f"{mid} unexpectedly emitted opacity.png"
+        em_arr = np.asarray(Image.open(d / "emissive.png").convert("RGB"), dtype=np.uint8)
+        assert em_arr.max() > 100, f"{mid} emissive too dim"
+
+    # 2. off on emissive material -> no emissive.png and no emissive slot in glTF
+    lava_auto = tmp_path / "em_cooling_lava_cracks"
+    lava_off = synthesize_material("cooling_lava_cracks", tmp_path / "lava_off", size=128, emissive="off")
+    assert not (lava_off / "emissive.png").exists()
+    assert not (lava_off / "opacity.png").exists()
+    g_off = export_material(lava_auto, tmp_path / "gltf_lava_off", target="gltf", emissive="off")
+    doc_off = json.loads((g_off / "material.gltf").read_text())
+    assert "emissiveTexture" not in doc_off["materials"][0]
+    assert "emissiveFactor" not in doc_off["materials"][0]
+    assert not (g_off / "emissive.png").exists()
+
+    # 3. auto vs on on opaque non-emissive material (bronze)
+    br_auto = synthesize_material("patinated_verdigris_bronze", tmp_path / "br_auto", size=128, emissive="auto")
+    assert not (br_auto / "emissive.png").exists()
+    br_on = synthesize_material("patinated_verdigris_bronze", tmp_path / "br_on", size=128, emissive="on")
+    assert (br_on / "emissive.png").exists()
+    assert np.asarray(Image.open(br_on / "emissive.png")).max() == 0
+    # Even if black emissive.png exists, auto export keeps glTF non-emissive
+    g_br_auto = export_material(br_on, tmp_path / "gltf_br_auto", target="gltf", emissive="auto")
+    doc_br_auto = json.loads((g_br_auto / "material.gltf").read_text())
+    assert "emissiveTexture" not in doc_br_auto["materials"][0]
+    assert not (g_br_auto / "emissive.png").exists()
+    # Forced emissive="on" export writes black emissive.png + emissiveTexture
+    g_br_on = export_material(br_auto, tmp_path / "gltf_br_on", target="gltf", emissive="on")
+    doc_br_on = json.loads((g_br_on / "material.gltf").read_text())
+    assert "emissiveTexture" in doc_br_on["materials"][0]
+    assert (g_br_on / "emissive.png").exists()
+    assert np.asarray(Image.open(g_br_on / "emissive.png")).max() == 0
+
+    # 4. blend in auto mode: opaque + opaque -> no emissive.png; lava + opaque -> emissive.png; off -> no emissive.png
+    bl_plain = blend_materials(br_auto, br_on, tmp_path / "bl_plain", emissive="auto")
+    assert not (bl_plain / "emissive.png").exists()
+    bl_lava = blend_materials(lava_auto, br_auto, tmp_path / "bl_lava", factor=0.35, emissive="auto")
+    assert (bl_lava / "emissive.png").exists()
+    assert not (bl_lava / "opacity.png").exists()
+    bl_lava_off = blend_materials(lava_auto, br_auto, tmp_path / "bl_lava_off", factor=0.35, emissive="off")
+    assert not (bl_lava_off / "emissive.png").exists()

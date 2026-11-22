@@ -48,6 +48,7 @@ VIEWER_HTML = """<!doctype html>
       <option value="height.png">Height</option>
       <option value="curvature.png">Curvature</option>
       <option value="opacity.png">Opacity (Cutout)</option>
+      <option value="emissive.png">Emissive (Glow)</option>
     </select>
   </div>
   <div class="row">
@@ -151,6 +152,27 @@ fetch("./opacity.png").then(r => r.ok ? r.blob() : null).then(blob => {{
   }};
   img.src = URL.createObjectURL(blob);
 }});
+fetch("./emissive.png").then(r => r.ok ? r.blob() : null).then(blob => {{
+  if (!blob) return;
+  const img = new Image();
+  img.onload = () => {{
+    const c = document.createElement("canvas");
+    c.width = Math.min(img.width, 128); c.height = Math.min(img.height, 128);
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0, c.width, c.height);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    let glowCount = 0;
+    const totalPx = d.length / 4;
+    for (let i = 0; i < d.length; i += 4) {{ if (Math.max(d[i], d[i + 1], d[i + 2]) > 50) glowCount++; }}
+    if (totalPx > 0 && (glowCount / totalPx) > 0.001) {{
+      pbrMat.emissive = new THREE.Color(0xffffff);
+      pbrMat.emissiveMap = loadTex("emissive.png", true);
+      pbrMat.emissiveIntensity = 1.6;
+      pbrMat.needsUpdate = true;
+    }}
+  }};
+  img.src = URL.createObjectURL(blob);
+}});
 
 const geoms = {{
   sphere: new THREE.SphereGeometry(1, 128, 128),
@@ -174,7 +196,7 @@ document.getElementById("channel").addEventListener("change", (e) => {{
   const v = e.target.value;
   if (v === "pbr") {{ mesh.material = pbrMat; }}
   else {{
-    flatMat.map = loadTex(v, v === "albedo_delit.png");
+    flatMat.map = loadTex(v, v === "albedo_delit.png" || v === "emissive.png");
     flatMat.needsUpdate = true;
     mesh.material = flatMat;
   }}

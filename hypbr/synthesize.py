@@ -34,7 +34,7 @@ from . import procedural as gd            # noqa: E402
 
 
 def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, cav: np.ndarray,
-                           ridge: np.ndarray, ao: np.ndarray, seed: int):
+                           ridge: np.ndarray, ao: np.ndarray, seed: int, geom_seed: int | None = None):
     """Synthesize physically-grounded multi-tone linear RGB albedo, metallic, and roughness offset."""
     H, W = h.shape
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -442,6 +442,66 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
         alb = alb * (1.0 - 0.94 * hole_m[..., None]) + void_c * (0.94 * hole_m[..., None])
         r_mod = 0.50 * hole_m - 0.05 * ridge
 
+    elif did in gd.EMISSIVE_MATERIALS:
+        gs = (seed - 2000) if geom_seed is None else geom_seed
+        g = gd._emissive_geom(did, H, W, gs)
+        if did == "cooling_lava_cracks":
+            basalt = np.array([0.055, 0.052, 0.054], np.float32)[None, None, :] * (0.85 + 0.35 * m1[..., None])
+            warm_rim = np.array([0.16, 0.065, 0.025], np.float32)[None, None, :]
+            hot_crust = np.array([0.28, 0.09, 0.02], np.float32)[None, None, :]
+            alb = basalt * (1.0 - 0.55 * g["glow_halo"][..., None]) + warm_rim * (0.55 * g["glow_halo"][..., None])
+            alb = alb * (1.0 - 0.65 * g["glow"][..., None]) + hot_crust * (0.65 * g["glow"][..., None])
+            r_mod = 0.06 * (1.0 - g["glow_halo"]) - 0.42 * g["glow_halo"]
+        elif did == "scifi_panel_emissive":
+            armor = np.array([0.22, 0.25, 0.30], np.float32)[None, None, :] * (0.92 + 0.08 * m1[..., None])
+            bevel_hi = np.array([0.46, 0.50, 0.56], np.float32)[None, None, :]
+            recess = np.array([0.045, 0.052, 0.065], np.float32)[None, None, :]
+            lens = np.array([0.36, 0.72, 0.80], np.float32)[None, None, :] * g["cyan"][..., None] + np.array([0.75, 0.44, 0.14], np.float32)[None, None, :] * g["amber"][..., None]
+            em_mask = np.clip(g["cyan"] + g["amber"], 0.0, 1.0)
+            alb = armor * (1.0 - 0.5 * ridge[..., None]) + bevel_hi * (0.5 * ridge[..., None])
+            alb = alb * (1.0 - 0.82 * g["cav"][..., None]) + recess * (0.82 * g["cav"][..., None])
+            alb = alb * (1.0 - em_mask[..., None]) + lens * em_mask[..., None]
+            met = np.clip(0.88 * (1.0 - 0.65 * g["cav"]) * (1.0 - em_mask), 0.0, 0.96).astype(np.float32)
+            r_mod = -0.06 * ridge + 0.32 * g["cav"] * (1.0 - em_mask) - 0.16 * em_mask
+        elif did == "circuit_board_glow":
+            solder = np.array([0.025, 0.075, 0.050], np.float32)[None, None, :] * (0.90 + 0.16 * m1[..., None])
+            gold = np.array([0.84, 0.63, 0.22], np.float32)[None, None, :]
+            copper = np.array([0.45, 0.32, 0.14], np.float32)[None, None, :]
+            glow_col = np.array([0.16, 0.52, 0.40], np.float32)[None, None, :]
+            em_m = np.clip(g["glow_traces"] + g["glow_nodes"], 0.0, 1.0)
+            alb = solder * (1.0 - g["passive_traces"][..., None]) + copper * g["passive_traces"][..., None]
+            alb = alb * (1.0 - g["pads"][..., None]) + gold * g["pads"][..., None]
+            alb = alb * (1.0 - em_m[..., None]) + glow_col * em_m[..., None]
+            met = np.clip(np.maximum(g["pads"] * 0.95, g["passive_traces"] * 0.82) * (1.0 - em_m), 0.0, 0.96).astype(np.float32)
+            r_mod = -0.24 * g["pads"] - 0.16 * g["passive_traces"] + 0.08 * (1.0 - g["pads"]) - 0.20 * em_m
+        elif did == "glowing_charcoal_embers":
+            char_c = np.array([0.032, 0.030, 0.029], np.float32)[None, None, :] * (0.85 + 0.30 * m1[..., None])
+            ash_c = np.array([0.38, 0.36, 0.34], np.float32)[None, None, :] * (0.85 + 0.25 * m2[..., None])
+            ember_c = np.array([0.32, 0.08, 0.02], np.float32)[None, None, :]
+            alb = char_c * (1.0 - 0.72 * g["ash"][..., None]) + ash_c * (0.72 * g["ash"][..., None])
+            alb = alb * (1.0 - g["glow"][..., None]) + ember_c * g["glow"][..., None]
+            r_mod = 0.06 * g["ash"] - 0.22 * g["glow"]
+        elif did == "carved_runic_stone":
+            slate = np.array([0.075, 0.085, 0.105], np.float32)[None, None, :] * (0.85 + 0.28 * m1[..., None])
+            moss_tint = np.array([0.13, 0.15, 0.16], np.float32)[None, None, :]
+            mortar_c = np.array([0.042, 0.045, 0.052], np.float32)[None, None, :]
+            crystal = np.array([0.28, 0.45, 0.62], np.float32)[None, None, :]
+            alb = slate * (1.0 - 0.25 * np.clip(m2, 0.0, 1.0)[..., None]) + moss_tint * (0.25 * np.clip(m2, 0.0, 1.0)[..., None])
+            alb = alb * (1.0 - g["mortar"][..., None]) + mortar_c * g["mortar"][..., None]
+            alb = alb * (1.0 - g["rune"][..., None]) + crystal * g["rune"][..., None]
+            r_mod = 0.14 * g["mortar"] - 0.36 * g["rune"] - 0.06 * ridge
+        else:  # neon_brick_wall
+            brick_a = np.array([0.24, 0.085, 0.065], np.float32)[None, None, :]
+            brick_b = np.array([0.13, 0.065, 0.055], np.float32)[None, None, :]
+            brick = (brick_a * (1.0 - g["brick_id"][..., None]) + brick_b * g["brick_id"][..., None]) * (0.86 + 0.28 * m1[..., None])
+            mortar_c = np.array([0.28, 0.26, 0.24], np.float32)[None, None, :]
+            glass_mag = np.array([0.72, 0.22, 0.48], np.float32)[None, None, :]
+            glass_cyn = np.array([0.20, 0.66, 0.78], np.float32)[None, None, :]
+            alb = brick * (1.0 - g["mortar"][..., None]) + mortar_c * g["mortar"][..., None]
+            alb = alb * (1.0 - g["tube_mag"][..., None]) + glass_mag * g["tube_mag"][..., None]
+            alb = alb * (1.0 - g["tube_cyn"][..., None]) + glass_cyn * g["tube_cyn"][..., None]
+            r_mod = 0.12 * g["mortar"] - 0.66 * g["tubes"]
+
     elif mat_kind == "metal":
         # Clean machined/cast metal: bare metallic across both decks and grooves; warm bronze-umber recesses for gold/brass!
         is_warm_metal = float(base[0, 0, 0]) > float(base[0, 0, 2]) * 1.35
@@ -475,7 +535,7 @@ def _rich_albedo_and_metal(did: str, mat_kind: str, tint: tuple, h: np.ndarray, 
     )
 
 
-def synthesize_hardops_plate(out_dir: Path, size: int = 512, transparency: str = "auto") -> Path:
+def synthesize_hardops_plate(out_dir: Path, size: int = 512, transparency: str = "auto", emissive: str = "auto") -> Path:
     """Synthesize a pure gunmetal machined HardOps panel using 8-Azimuth HBAO + Bent Normal."""
     H = W = size
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
@@ -541,9 +601,11 @@ def synthesize_hardops_plate(out_dir: Path, size: int = 512, transparency: str =
         (out_dir / "anisotropy.png", aniso["anisotropy_u8"]),
         (out_dir / "specular.png", aniso["specular_u8"]),
         (out_dir / "thickness.png", thick["thickness_u8"]),
-    ] + ([(out_dir / "opacity.png", np.full((H, W), 255, dtype=np.uint8))] if normalize_transparency_mode(transparency) == "on" else []))
+    ] + ([(out_dir / "opacity.png", np.full((H, W), 255, dtype=np.uint8))] if normalize_transparency_mode(transparency) == "on" else []) + ([(out_dir / "emissive.png", np.zeros((H, W, 3), dtype=np.uint8))] if normalize_emissive_mode(emissive) == "on" else []))
     if normalize_transparency_mode(transparency) != "on" and (out_dir / "opacity.png").exists():
         (out_dir / "opacity.png").unlink()
+    if normalize_emissive_mode(emissive) != "on" and (out_dir / "emissive.png").exists():
+        (out_dir / "emissive.png").unlink()
     return out_dir
 
 
@@ -562,6 +624,23 @@ def normalize_transparency_mode(mode: str | None) -> str:
 def has_meaningful_cutout(opacity_01: np.ndarray, min_hole_frac: float = MEANINGFUL_HOLE_FRAC) -> bool:
     """Return True when >0.5% of pixels have alpha < 0.5."""
     return float(np.mean(opacity_01 < 0.5)) > min_hole_frac
+
+
+EMISSIVE_MODES = ("auto", "on", "off")
+MEANINGFUL_EMISSIVE_FRAC = 0.001
+
+
+def normalize_emissive_mode(mode: str | None) -> str:
+    m = (mode or "auto").strip().lower()
+    if m not in EMISSIVE_MODES:
+        raise ValueError(f"Unsupported emissive mode {mode!r}; expected one of {EMISSIVE_MODES}")
+    return m
+
+
+def has_meaningful_emissive(emissive_01: np.ndarray, min_frac: float = MEANINGFUL_EMISSIVE_FRAC) -> bool:
+    """Return True when >0.1% of pixels emit non-negligible glow (> 0.03)."""
+    peak = np.max(emissive_01, axis=-1) if emissive_01.ndim == 3 else emissive_01
+    return float(np.mean(peak > 0.03)) > min_frac
 
 
 def list_materials() -> list[dict[str, str]]:
@@ -590,6 +669,7 @@ def render_studio_preview(
     met: np.ndarray,
     ao: np.ndarray,
     opacity: np.ndarray | None = None,
+    emissive: np.ndarray | None = None,
 ) -> np.ndarray:
     """Physically-based Cook-Torrance GGX + Lagarde Fresnel IBL studio preview (zero matte plastic glare)."""
     if dp.DEVICE.type != "cpu" and rough.size >= 262144:
@@ -649,7 +729,11 @@ def render_studio_preview(
         ) * (0.35 + 0.65 * ao3)
 
         diffuse = diff_col * (0.24 + 0.86 * ndotl1.unsqueeze(-1) + 0.26 * ndotl2.unsqueeze(-1)) * (0.28 + 0.72 * ao3)
-        col = diffuse + spec_ibl + spec_direct
+        if emissive is not None and has_meaningful_emissive(emissive):
+            em_t = torch.from_numpy(np.ascontiguousarray(emissive, dtype=np.float32)).to(dev)
+            col = (diffuse + spec_ibl + spec_direct) * 0.62 + em_t * 1.45
+        else:
+            col = diffuse + spec_ibl + spec_direct
         # Smooth ACES-like highlight roll-off
         col = col / (1.0 + 0.26 * col)
         if opacity is not None and has_meaningful_cutout(opacity):
@@ -712,7 +796,10 @@ def render_studio_preview(
     ) * (0.35 + 0.65 * ao3)
 
     diffuse = diff_col * (0.24 + 0.86 * ndotl1[..., None] + 0.26 * ndotl2[..., None]) * (0.28 + 0.72 * ao3)
-    col = diffuse + spec_ibl + spec_direct
+    if emissive is not None and has_meaningful_emissive(emissive):
+        col = (diffuse + spec_ibl + spec_direct) * 0.62 + emissive.astype(np.float32) * 1.45
+    else:
+        col = diffuse + spec_ibl + spec_direct
     col = col / (1.0 + 0.26 * col)
     if opacity is not None and has_meaningful_cutout(opacity):
         return _composite_cutout_preview(col, opacity)
@@ -742,6 +829,7 @@ def synthesize_material(
     seed: int | None = None,
     wear: float = 0.0,
     transparency: str = "auto",
+    emissive: str = "auto",
 ) -> Path:
     """Synthesize a complete seamless 15-map PBR material set into `out_dir`.
 
@@ -782,7 +870,7 @@ def synthesize_material(
     )
     ao = hbao["ao"]
     curv = ng.node_curvature_multiscale({"circular": True}, {"normal": N_geom}, gain=2.8)
-    alb_u8, alb_lin, met_u8, r_mod = _rich_albedo_and_metal(material_id, mat_kind, tint, h_n, cav0, ridge0, ao, seed=s_base + 2000)
+    alb_u8, alb_lin, met_u8, r_mod = _rich_albedo_and_metal(material_id, mat_kind, tint, h_n, cav0, ridge0, ao, seed=s_base + 2000, geom_seed=s_base)
 
     r_micro = 0.025 * gd._periodic_fbm(H, W, s_base + 3000, (8, 24, 48))
     ao_r_w = 0.08 if mat_kind == "metal" else 0.14
@@ -874,12 +962,31 @@ def synthesize_material(
     meaningful_op = has_meaningful_cutout(op_f)
     write_opacity = (t_mode == "on") or (t_mode == "auto" and meaningful_op)
     op_u8 = np.clip(op_f * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    prev_u8 = render_studio_preview(alb_lin, N, rough, met_f, ao, opacity=(op_f if write_opacity and meaningful_op else None))
+    e_mode = normalize_emissive_mode(emissive)
+    if e_mode != "off" and material_id in getattr(gd, "EMISSIVE_MATERIALS", ()):
+        em_lin = gd.build_emissive_map(material_id, H, W, seed=s_base)
+    else:
+        em_lin = np.zeros((H, W, 3), dtype=np.float32)
+    meaningful_em = has_meaningful_emissive(em_lin)
+    write_emissive = (e_mode == "on") or (e_mode == "auto" and meaningful_em)
+    em_u8 = np.clip(np.power(np.clip(em_lin, 0.0, 1.0), 1.0 / 2.2) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+    prev_u8 = render_studio_preview(
+        alb_lin, N, rough, met_f, ao,
+        opacity=(op_f if write_opacity and meaningful_op else None),
+        emissive=(em_lin if write_emissive and meaningful_em else None),
+    )
 
     aniso = ng.node_anisotropy_flow({"circular": True}, {"height": h_n, "ao": ao, "roughness": rough})
     thick = ng.node_thickness_subsurface({"circular": True}, {"height": h_n})
     rough_u8 = np.clip(rough * 255.0 + 0.5, 0, 255).astype(np.uint8)
     orm_u8 = np.stack([hbao["ao_u8"], rough_u8, met_u8], axis=-1)
+
+    extra_maps = []
+    if write_opacity:
+        extra_maps.append((d / "opacity.png", op_u8))
+    if write_emissive:
+        extra_maps.append((d / "emissive.png", em_u8))
 
     save_maps_parallel([
         (d / "albedo_delit.png", alb_u8),
@@ -898,9 +1005,11 @@ def synthesize_material(
         (d / "anisotropy.png", aniso["anisotropy_u8"]),
         (d / "specular.png", aniso["specular_u8"]),
         (d / "thickness.png", thick["thickness_u8"]),
-    ] + ([(d / "opacity.png", op_u8)] if write_opacity else []))
+    ] + extra_maps)
     if not write_opacity and (d / "opacity.png").exists():
         (d / "opacity.png").unlink()
+    if not write_emissive and (d / "emissive.png").exists():
+        (d / "emissive.png").unlink()
     return d
 
 
@@ -910,11 +1019,12 @@ def synthesize_all(
     materials: list[str] | None = None,
     wear: float = 0.0,
     transparency: str = "auto",
+    emissive: str = "auto",
 ) -> list[Path]:
     """Synthesize all (or selected) seamless materials into `out_dir/<material_id>/`."""
     root = Path(out_dir)
     ids = materials if materials is not None else [did for did, *_ in gd.DAILY_CATALOG]
-    return [synthesize_material(mid, root / mid, size=size, wear=wear, transparency=transparency) for mid in ids]
+    return [synthesize_material(mid, root / mid, size=size, wear=wear, transparency=transparency, emissive=emissive) for mid in ids]
 
 
 def main():

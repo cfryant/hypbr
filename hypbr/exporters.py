@@ -111,7 +111,32 @@ def _save_rgba_with_opacity(rgb_path: Path, op_arr: np.ndarray, out_path: Path) 
     Image.fromarray(rgba, mode="RGBA").save(out_path)
 
 
-def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False, transparency: str = "auto") -> Path:
+def _load_emissive(
+    src_dir: Path,
+    size: tuple[int, int] | None = None,
+    emissive: str = "auto",
+) -> tuple[bool, np.ndarray | None]:
+    """Return (has_emissive, uint8_rgb_array) honoring emissive mode ('auto' | 'on' | 'off')."""
+    mode = (emissive or "auto").strip().lower()
+    if mode not in ("auto", "on", "off"):
+        raise ValueError(f"Unsupported emissive mode {emissive!r}")
+    if mode == "off":
+        return False, None
+    em_path = src_dir / "emissive.png"
+    if not em_path.exists():
+        if mode == "on":
+            w, h = size or _detect_size(src_dir)
+            return True, np.zeros((h, w, 3), dtype=np.uint8)
+        return False, None
+    em = _load_rgb(em_path, default=(0, 0, 0), size=size)
+    if mode == "on":
+        return True, em
+    em_lin = np.power(em.astype(np.float32) / 255.0, 2.2)
+    peak = np.max(em_lin, axis=-1)
+    return bool(float((peak > 0.03).mean()) > 0.001), em
+
+
+def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -122,6 +147,9 @@ def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False, t
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "BaseMap.png")
     if has_cutout:
         _copy_if_exists(src_dir / "opacity.png", out_dir / "OpacityMask.png")
+    has_emissive, em_arr = _load_emissive(src_dir, size=size, emissive=emissive)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "EmissionMap.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "NormalMap.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "HeightMap.png")
     _copy_if_exists(src_dir / "height16.png", out_dir / "HeightMap16.png")
@@ -177,11 +205,17 @@ def _export_unity(src_dir: Path, out_dir: Path, name: str, hdrp: bool = False, t
         manifest["alphaCutoff"] = 0.5
         manifest["doubleSided"] = True
         manifest["textures"]["OpacityMask"] = {"file": "OpacityMask.png", "sRGB": False}
+    if has_emissive:
+        s = float(emissive_strength)
+        manifest["emission"] = True
+        manifest["emissionColor"] = [s, s, s]
+        manifest["emissiveStrength"] = s
+        manifest["textures"]["EmissionMap"] = {"file": "EmissionMap.png", "sRGB": True}
     (out_dir / "unity_material.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return out_dir
 
 
-def _export_godot(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_godot(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
@@ -191,18 +225,24 @@ def _export_godot(src_dir: Path, out_dir: Path, name: str, transparency: str = "
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "albedo.png")
     if has_cutout:
         _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
+    has_emissive, em_arr = _load_emissive(src_dir, size=size, emissive=emissive)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
     _copy_if_exists(src_dir / "height.png", out_dir / "height.png")
     _copy_if_exists(src_dir / "anisotropy.png", out_dir / "anisotropy.png")
 
+    load_steps = 5 + (1 if has_emissive else 0)
+    em_ext = '\n[ext_resource type="Texture2D" path="emissive.png" id="5_emissive"]' if has_emissive else ""
     cutout_block = "transparency = 2\nalpha_scissor_threshold = 0.5\ncull_mode = 2\n" if has_cutout else ""
-    tres = f"""[gd_resource type="StandardMaterial3D" load_steps=5 format=3]
+    em_block = f'emission_enabled = true\nemission = Color(1, 1, 1, 1)\nemission_energy_multiplier = {float(emissive_strength):.4f}\nemission_texture = ExtResource("5_emissive")\n' if has_emissive else ""
+    tres = f"""[gd_resource type="StandardMaterial3D" load_steps={load_steps} format=3]
 
 [ext_resource type="Texture2D" path="albedo.png" id="1_albedo"]
 [ext_resource type="Texture2D" path="orm.png" id="2_orm"]
 [ext_resource type="Texture2D" path="normal.png" id="3_normal"]
-[ext_resource type="Texture2D" path="height.png" id="4_height"]
+[ext_resource type="Texture2D" path="height.png" id="4_height"]{em_ext}
 
 [resource]
 resource_name = "{name}"
@@ -223,12 +263,12 @@ heightmap_deep_parallax = true
 heightmap_min_layers = 8
 heightmap_max_layers = 32
 heightmap_texture = ExtResource("4_height")
-{cutout_block}"""
+{cutout_block}{em_block}"""
     (out_dir / "material.tres").write_text(tres)
     return out_dir
 
 
-def _export_unreal(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_unreal(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -239,6 +279,9 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str, transparency: str = 
     has_cutout, _ = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
     if has_cutout:
         _copy_if_exists(src_dir / "opacity.png", out_dir / "T_OpacityMask.png")
+    has_emissive, em_arr = _load_emissive(src_dir, size=size, emissive=emissive)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "T_Emissive.png")
 
     normal_gl = _load_rgb(src_dir / "normal.png", default=(128, 128, 255), size=size)
     Image.fromarray(_flip_normal_green(normal_gl), mode="RGB").save(out_dir / "T_Normal_DX.png")
@@ -268,13 +311,17 @@ def _export_unreal(src_dir: Path, out_dir: Path, name: str, transparency: str = 
         manifest["blendMode"] = "BLEND_Masked"
         manifest["twoSided"] = True
         manifest["textures"]["OpacityMask"] = {"file": "T_OpacityMask.png", "sRGB": False, "compression": "TC_Masks"}
+    if has_emissive:
+        manifest["emissiveStrength"] = float(emissive_strength)
+        manifest["textures"]["EmissiveColor"] = {"file": "T_Emissive.png", "sRGB": True, "compression": "TC_Default"}
     (out_dir / "ue5_material.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return out_dir
 
 
-def _export_blender(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_blender(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, emissive=emissive)
     for src_name, dst_name in (
         ("albedo_delit.png", "albedo.png"),
         ("normal.png", "normal.png"),
@@ -283,9 +330,10 @@ def _export_blender(src_dir: Path, out_dir: Path, name: str, transparency: str =
         ("ao.png", "ao.png"),
         ("height16.png", "height16.png"),
         ("specular.png", "specular.png"),
-        ("opacity.png", "opacity.png"),
-    ):
+    ) + ((("opacity.png", "opacity.png"),) if has_cutout else ()):
         _copy_if_exists(src_dir / src_name, out_dir / dst_name)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
 
     script = f'''"""Auto-generated Blender 4.x Principled BSDF importer for `{name}`."""
 from pathlib import Path
@@ -356,6 +404,15 @@ def create_material(mat_name: str = "{name}") -> bpy.types.Material:
     if tex_op:
         nt.links.new(tex_op.outputs["Color"], bsdf.inputs["Alpha"])
 
+    tex_em = load_tex("emissive.png", "sRGB", (-420, -1360))
+    if tex_em:
+        if "Emission Color" in bsdf.inputs:
+            nt.links.new(tex_em.outputs["Color"], bsdf.inputs["Emission Color"])
+        elif "Emission" in bsdf.inputs:
+            nt.links.new(tex_em.outputs["Color"], bsdf.inputs["Emission"])
+        if "Emission Strength" in bsdf.inputs:
+            bsdf.inputs["Emission Strength"].default_value = {float(emissive_strength):.4f}
+
     return mat
 
 
@@ -366,9 +423,10 @@ if __name__ == "__main__":
     return out_dir
 
 
-def _export_threejs(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_threejs(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, emissive=emissive)
     for src_name, dst_name in (
         ("albedo_delit.png", "color.png"),
         ("normal.png", "normal.png"),
@@ -377,12 +435,13 @@ def _export_threejs(src_dir: Path, out_dir: Path, name: str, transparency: str =
         ("ao.png", "ao.png"),
         ("height.png", "displacement.png"),
         ("orm.png", "orm.png"),
-        ("opacity.png", "opacity.png"),
-    ):
+    ) + ((("opacity.png", "opacity.png"),) if has_cutout else ()):
         _copy_if_exists(src_dir / src_name, out_dir / dst_name)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
 
-    has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
     alpha_block = "\n    alphaMap: load(\"opacity.png\", false),\n    alphaTest: 0.5,\n    side: THREE.DoubleSide," if has_cutout else ""
+    emissive_block = f'\n    emissive: new THREE.Color(0xffffff),\n    emissiveMap: load("emissive.png", true),\n    emissiveIntensity: {float(emissive_strength):.4f},' if has_emissive else ""
     js = f"""// Auto-generated Three.js MeshPhysicalMaterial factory for `{name}`
 import * as THREE from "three";
 
@@ -411,7 +470,7 @@ export function createMaterial(
     displacementMap: load("displacement.png", false),
     displacementScale,
     roughness: 1.0,
-    metalness: 1.0,{alpha_block}
+    metalness: 1.0,{alpha_block}{emissive_block}
   }});
 }}
 """
@@ -419,20 +478,23 @@ export function createMaterial(
     return out_dir
 
 
-def _export_gltf(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_gltf(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     size = _detect_size(src_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, op_arr = _load_cutout_opacity(src_dir, size=size, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, size=size, emissive=emissive)
     if has_cutout and op_arr is not None:
         _save_rgba_with_opacity(src_dir / "albedo_delit.png", op_arr, out_dir / "baseColor.png")
     else:
         _copy_if_exists(src_dir / "albedo_delit.png", out_dir / "baseColor.png")
     if has_cutout:
         _copy_if_exists(src_dir / "opacity.png", out_dir / "opacity.png")
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
     _copy_if_exists(src_dir / "orm.png", out_dir / "orm.png")
     _copy_if_exists(src_dir / "normal.png", out_dir / "normal.png")
 
-    gltf = {
+    gltf: dict[str, Any] = {
         "asset": {"version": "2.0", "generator": "hypbr"},
         "samplers": [
             {
@@ -470,6 +532,18 @@ def _export_gltf(src_dir: Path, out_dir: Path, name: str, transparency: str = "a
         gltf["materials"][0]["alphaMode"] = "MASK"
         gltf["materials"][0]["alphaCutoff"] = 0.5
         gltf["materials"][0]["doubleSided"] = True
+    if has_emissive:
+        em_img_idx = len(gltf["images"])
+        gltf["images"].append({"uri": "emissive.png", "mimeType": "image/png"})
+        em_tex_idx = len(gltf["textures"])
+        gltf["textures"].append({"sampler": 0, "source": em_img_idx})
+        gltf["materials"][0]["emissiveTexture"] = {"index": em_tex_idx}
+        gltf["materials"][0]["emissiveFactor"] = [1.0, 1.0, 1.0]
+        if float(emissive_strength) > 1.0:
+            gltf["extensionsUsed"] = ["KHR_materials_emissive_strength"]
+            gltf["materials"][0]["extensions"] = {
+                "KHR_materials_emissive_strength": {"emissiveStrength": float(emissive_strength)}
+            }
     (out_dir / "material.gltf").write_text(json.dumps(gltf, indent=2) + "\n")
     return out_dir
 
@@ -535,13 +609,18 @@ def _export_vulkan(src_dir: Path, out_dir: Path, name: str) -> Path:
     return out_dir
 
 
-def _export_materialx(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_materialx(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, emissive=emissive)
     for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png") + (("opacity.png",) if has_cutout else ()):
         _copy_if_exists(src_dir / fname, out_dir / fname)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
     op_ng = '\n    <image name="img_opacity" type="float"><input name="file" type="filename" value="opacity.png" colorspace="lin_rec709" /></image>\n    <output name="out_opacity" type="float" nodename="img_opacity" />' if has_cutout else ""
     op_sr = f'\n    <input name="opacity" type="float" nodegraph="NG_{name}" output="out_opacity" />' if has_cutout else ""
+    em_ng = '\n    <image name="img_emissive" type="color3"><input name="file" type="filename" value="emissive.png" colorspace="srgb_texture" /></image>\n    <output name="out_emissive" type="color3" nodename="img_emissive" />' if has_emissive else ""
+    em_sr = f'\n    <input name="emission" type="float" value="{float(emissive_strength):.4f}" />\n    <input name="emission_color" type="color3" nodegraph="NG_{name}" output="out_emissive" />' if has_emissive else ""
 
     mtlx = f"""<?xml version="1.0"?>
 <materialx version="1.38">
@@ -568,14 +647,14 @@ def _export_materialx(src_dir: Path, out_dir: Path, name: str, transparency: str
     <output name="out_roughness" type="float" nodename="img_roughness" />
     <output name="out_metallic" type="float" nodename="img_metallic" />
     <output name="out_normal" type="vector3" nodename="nrm_map" />
-    <output name="out_height" type="float" nodename="img_height" />{op_ng}
+    <output name="out_height" type="float" nodename="img_height" />{op_ng}{em_ng}
   </nodegraph>
 
   <standard_surface name="SR_{name}" type="surfaceshader">
     <input name="base_color" type="color3" nodegraph="NG_{name}" output="out_albedo" />
     <input name="specular_roughness" type="float" nodegraph="NG_{name}" output="out_roughness" />
     <input name="metalness" type="float" nodegraph="NG_{name}" output="out_metallic" />
-    <input name="normal" type="vector3" nodegraph="NG_{name}" output="out_normal" />{op_sr}
+    <input name="normal" type="vector3" nodegraph="NG_{name}" output="out_normal" />{op_sr}{em_sr}
   </standard_surface>
 
   <displacement name="DISP_{name}" type="displacementshader">
@@ -630,7 +709,7 @@ def _build_uv_sphere(rings: int = 32, sectors: int = 64) -> tuple[np.ndarray, np
     )
 
 
-def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     """Export a single self-contained binary glTF 2.0 (.glb) preview sphere with embedded PBR maps."""
     out_dir.mkdir(parents=True, exist_ok=True)
     pos, nrm, tan, uv, idx = _build_uv_sphere()
@@ -658,6 +737,7 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "au
 
     import io
     has_cutout, op_arr = _load_cutout_opacity(src_dir, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, emissive=emissive)
     img_views: list[int] = []
     for fname in ("albedo_delit.png", "orm.png", "normal.png"):
         p = src_dir / fname
@@ -670,6 +750,11 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "au
             img_views.append(add_view(buf.getvalue()))
         else:
             img_views.append(add_view(p.read_bytes()))
+    bv_em: int | None = None
+    if has_emissive and em_arr is not None:
+        buf_em = io.BytesIO()
+        Image.fromarray(em_arr, mode="RGB").save(buf_em, format="PNG")
+        bv_em = add_view(buf_em.getvalue())
 
     bin_data = b"".join(bin_chunks)
     gltf_doc: dict[str, Any] = {
@@ -735,6 +820,18 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "au
         gltf_doc["materials"][0]["alphaMode"] = "MASK"
         gltf_doc["materials"][0]["alphaCutoff"] = 0.5
         gltf_doc["materials"][0]["doubleSided"] = True
+    if has_emissive and bv_em is not None:
+        em_img_idx = len(gltf_doc["images"])
+        gltf_doc["images"].append({"bufferView": bv_em, "mimeType": "image/png", "name": "emissive"})
+        em_tex_idx = len(gltf_doc["textures"])
+        gltf_doc["textures"].append({"sampler": 0, "source": em_img_idx})
+        gltf_doc["materials"][0]["emissiveTexture"] = {"index": em_tex_idx}
+        gltf_doc["materials"][0]["emissiveFactor"] = [1.0, 1.0, 1.0]
+        if float(emissive_strength) > 1.0:
+            gltf_doc["extensionsUsed"] = ["KHR_materials_emissive_strength"]
+            gltf_doc["materials"][0]["extensions"] = {
+                "KHR_materials_emissive_strength": {"emissiveStrength": float(emissive_strength)}
+            }
     json_bytes = json.dumps(gltf_doc, separators=(",", ":")).encode("utf-8")
     json_pad = (-len(json_bytes)) % 4
     json_bytes += b" " * json_pad
@@ -750,12 +847,15 @@ def _export_glb(src_dir: Path, out_dir: Path, name: str, transparency: str = "au
     return out_dir
 
 
-def _export_usd(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto") -> Path:
+def _export_usd(src_dir: Path, out_dir: Path, name: str, transparency: str = "auto", emissive: str = "auto", emissive_strength: float = 1.0) -> Path:
     """Export an OpenUSD ASCII (.usda) UsdPreviewSurface material (RealityKit / Omniverse / Houdini)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     has_cutout, _ = _load_cutout_opacity(src_dir, transparency=transparency)
+    has_emissive, em_arr = _load_emissive(src_dir, emissive=emissive)
     for fname in ("albedo_delit.png", "normal.png", "roughness.png", "metallic.png", "ao.png", "height16.png") + (("opacity.png",) if has_cutout else ()):
         _copy_if_exists(src_dir / fname, out_dir / fname)
+    if has_emissive and em_arr is not None:
+        Image.fromarray(em_arr, mode="RGB").save(out_dir / "emissive.png")
 
     safe = "".join(c if (c.isalnum() or c == "_") else "_" for c in name)
     if not safe or safe[0].isdigit():
@@ -774,6 +874,21 @@ def _export_usd(src_dir: Path, out_dir: Path, name: str, transparency: str = "au
             float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
             float outputs:r
         }}}}""" if has_cutout else ""
+    s_em = float(emissive_strength)
+    usd_em_conn = f"\n            color3f inputs:emissiveColor.connect = </{safe}_Root/{safe}/TexEmissive.outputs:rgb>" if has_emissive else ""
+    usd_em_scale = f"\n            float4 inputs:scale = ({s_em:.4f}, {s_em:.4f}, {s_em:.4f}, 1)" if abs(s_em - 1.0) > 1e-4 else ""
+    usd_em_node = f"""
+
+        def Shader "TexEmissive"
+        {{{{
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./emissive.png@
+            token inputs:sourceColorSpace = "sRGB"{usd_em_scale}
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
+            color3f outputs:rgb
+        }}}}""" if has_emissive else ""
     usda = f"""#usda 1.0
 (
     defaultPrim = "{safe}_Root"
@@ -795,7 +910,7 @@ def Xform "{safe}_Root"
             float inputs:roughness.connect = </{safe}_Root/{safe}/TexRoughness.outputs:r>
             float inputs:occlusion.connect = </{safe}_Root/{safe}/TexAO.outputs:r>
             normal3f inputs:normal.connect = </{safe}_Root/{safe}/TexNormal.outputs:rgb>
-            float inputs:ior = 1.5{usd_op_conn}
+            float inputs:ior = 1.5{usd_op_conn}{usd_em_conn}
             token outputs:surface
         }}
 
@@ -861,7 +976,7 @@ def Xform "{safe}_Root"
             token inputs:wrapT = "repeat"
             float2 inputs:st.connect = </{safe}_Root/{safe}/PrimvarReader.outputs:result>
             normal3f outputs:rgb
-        }}{usd_op_node}
+        }}{usd_op_node}{usd_em_node}
     }}
 }}
 """
@@ -875,6 +990,8 @@ def export_material(
     target: str,
     name: str | None = None,
     transparency: str = "auto",
+    emissive: str = "auto",
+    emissive_strength: float = 1.0,
 ) -> Path:
     """Export a synthesized hypbr material directory to a target engine/format.
 
@@ -894,26 +1011,26 @@ def export_material(
     t = target.lower().strip()
 
     if t == "unity":
-        return _export_unity(src, dst, mat_name, hdrp=False, transparency=transparency)
+        return _export_unity(src, dst, mat_name, hdrp=False, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "unity-hdrp":
-        return _export_unity(src, dst, mat_name, hdrp=True, transparency=transparency)
+        return _export_unity(src, dst, mat_name, hdrp=True, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "godot":
-        return _export_godot(src, dst, mat_name, transparency=transparency)
+        return _export_godot(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "unreal":
-        return _export_unreal(src, dst, mat_name, transparency=transparency)
+        return _export_unreal(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "blender":
-        return _export_blender(src, dst, mat_name, transparency=transparency)
+        return _export_blender(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "threejs":
-        return _export_threejs(src, dst, mat_name, transparency=transparency)
+        return _export_threejs(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "gltf":
-        return _export_gltf(src, dst, mat_name, transparency=transparency)
+        return _export_gltf(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "glb":
-        return _export_glb(src, dst, mat_name, transparency=transparency)
+        return _export_glb(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "vulkan":
         return _export_vulkan(src, dst, mat_name)
     if t == "materialx":
-        return _export_materialx(src, dst, mat_name, transparency=transparency)
+        return _export_materialx(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
     if t == "usd":
-        return _export_usd(src, dst, mat_name, transparency=transparency)
+        return _export_usd(src, dst, mat_name, transparency=transparency, emissive=emissive, emissive_strength=emissive_strength)
 
     raise ValueError(f"Unsupported export target {target!r}. Choose one of: {', '.join(SUPPORTED_TARGETS)}")

@@ -94,3 +94,93 @@ def test_all_engine_exporters(tmp_path: Path) -> None:
     assert "#usda 1.0" in usda
     assert "UsdPreviewSurface" in usda
     assert "float4 inputs:scale = (2, 2, 2, 1)" in usda
+
+
+
+def test_emissive_exporters_and_strength(tmp_path: Path) -> None:
+    import struct
+
+    # Non-emissive source must have no emissive slot in any target
+    opaque_src = synthesize_material("damascus_folded_steel", tmp_path / "opaque_src", size=64)
+    g_non = export_material(opaque_src, tmp_path / "out_non_gltf", target="gltf", name="damascus")
+    doc_non = json.loads((g_non / "material.gltf").read_text())
+    assert "emissiveTexture" not in doc_non["materials"][0]
+    assert "emissiveFactor" not in doc_non["materials"][0]
+    assert not (g_non / "emissive.png").exists()
+    assert "emissiveMap" not in (export_material(opaque_src, tmp_path / "out_non_three", target="threejs", name="damascus") / "material.js").read_text()
+
+    # Emissive source across all targets that handle opacity/emissive
+    em_src = synthesize_material("scifi_panel_emissive", tmp_path / "em_src", size=64)
+    assert (em_src / "emissive.png").exists()
+    assert not (em_src / "opacity.png").exists()
+
+    for target in SUPPORTED_TARGETS:
+        out = export_material(em_src, tmp_path / "em_out" / target, target=target, name="scifi", emissive_strength=2.5)
+        assert out.exists()
+
+    # Unity URP + HDRP
+    u_urp = json.loads((tmp_path / "em_out" / "unity" / "unity_material.json").read_text())
+    assert u_urp["emission"] is True
+    assert u_urp["emissiveStrength"] == 2.5
+    assert "EmissionMap" in u_urp["textures"]
+    assert (tmp_path / "em_out" / "unity" / "EmissionMap.png").exists()
+    u_hdrp = json.loads((tmp_path / "em_out" / "unity-hdrp" / "unity_material.json").read_text())
+    assert u_hdrp["emission"] is True
+    assert (tmp_path / "em_out" / "unity-hdrp" / "EmissionMap.png").exists()
+
+    # Godot
+    tres = (tmp_path / "em_out" / "godot" / "material.tres").read_text()
+    assert "emission_enabled = true" in tres
+    assert "emission_energy_multiplier = 2.5000" in tres
+    assert (tmp_path / "em_out" / "godot" / "emissive.png").exists()
+
+    # Unreal
+    ue = json.loads((tmp_path / "em_out" / "unreal" / "ue5_material.json").read_text())
+    assert ue["emissiveStrength"] == 2.5
+    assert "EmissiveColor" in ue["textures"]
+    assert (tmp_path / "em_out" / "unreal" / "T_Emissive.png").exists()
+
+    # Blender
+    bl_py = (tmp_path / "em_out" / "blender" / "import_blender.py").read_text()
+    ast.parse(bl_py)
+    assert "Emission Color" in bl_py
+    assert "2.5000" in bl_py
+    assert (tmp_path / "em_out" / "blender" / "emissive.png").exists()
+
+    # Three.js
+    three_js = (tmp_path / "em_out" / "threejs" / "material.js").read_text()
+    assert "emissiveMap:" in three_js
+    assert "emissiveIntensity: 2.5000" in three_js
+    assert (tmp_path / "em_out" / "threejs" / "emissive.png").exists()
+
+    # glTF (strength=1.0 omits KHR_materials_emissive_strength; strength=2.5 includes it)
+    g1 = export_material(em_src, tmp_path / "em_gltf_1", target="gltf", name="scifi", emissive_strength=1.0)
+    doc1 = json.loads((g1 / "material.gltf").read_text())
+    assert "emissiveTexture" in doc1["materials"][0]
+    assert doc1["materials"][0]["emissiveFactor"] == [1.0, 1.0, 1.0]
+    assert "extensionsUsed" not in doc1
+
+    doc2 = json.loads((tmp_path / "em_out" / "gltf" / "material.gltf").read_text())
+    assert "KHR_materials_emissive_strength" in doc2["extensionsUsed"]
+    assert doc2["materials"][0]["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"] == 2.5
+
+    # GLB
+    glb_bytes = (tmp_path / "em_out" / "glb" / "scifi.glb").read_bytes()
+    j_len, _ = struct.unpack_from("<II", glb_bytes, 12)
+    glb_doc = json.loads(glb_bytes[20 : 20 + j_len].decode("utf-8"))
+    assert len(glb_doc["images"]) == 4
+    assert "emissiveTexture" in glb_doc["materials"][0]
+    assert "KHR_materials_emissive_strength" in glb_doc["extensionsUsed"]
+    assert glb_doc["materials"][0]["extensions"]["KHR_materials_emissive_strength"]["emissiveStrength"] == 2.5
+
+    # MaterialX
+    mtlx_txt = (tmp_path / "em_out" / "materialx" / "material.mtlx").read_text()
+    ET.fromstring(mtlx_txt)
+    assert "emission_color" in mtlx_txt
+    assert (tmp_path / "em_out" / "materialx" / "emissive.png").exists()
+
+    # USD
+    usda = (tmp_path / "em_out" / "usd" / "material.usda").read_text()
+    assert "inputs:emissiveColor.connect" in usda
+    assert "TexEmissive" in usda
+    assert (tmp_path / "em_out" / "usd" / "emissive.png").exists()

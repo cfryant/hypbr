@@ -29,6 +29,8 @@ SPECIAL_MIXED_METALS = {
     "damascus_folded_steel",
     "hammered_copper_dimple",
     "chainlink_fence_galvanized",
+    "scifi_panel_emissive",
+    "circuit_board_glow",
 }
 
 
